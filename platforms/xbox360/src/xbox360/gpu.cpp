@@ -76,11 +76,14 @@ void SetReg(uint32_t r, uint32_t v) { Wr32(kGpuRegisters + 4 * r, v); }
 
 uint32_t Bswap(uint32_t v) { return v >> 24 | (v >> 8 & 0xFF00) | (v << 8 & 0xFF0000) | v << 24; }
 
-// The GPU's own word accesses: little-endian, after the swap.
+// The GPU's own word accesses: little-endian, after the swap, after the
+// resolves before them.
 uint32_t GpuRead(uint32_t addr) {
+  LandResolves();
   return GpuSwap(Bswap(Rd32(PhysicalToVirtual(addr & ~3u))), addr);
 }
 void GpuWrite(uint32_t addr, uint32_t v) {
+  LandResolves();
   Wr32(PhysicalToVirtual(addr & ~3u), Bswap(GpuSwap(v, addr)));
 }
 
@@ -125,7 +128,10 @@ void WriteRegister(uint32_t r, uint32_t v) {
   if (r - kRegScratchReg0 < 8) {
     // Scratch registers enabled in SCRATCH_UMSK are written back to memory.
     uint32_t n = r - kRegScratchReg0;
-    if (GpuRegister(kRegScratchUmsk) >> n & 1) Wr32(PhysicalToVirtual(GpuRegister(kRegScratchAddr) + 4 * n), v);
+    if (GpuRegister(kRegScratchUmsk) >> n & 1) {
+      LandResolves();
+      Wr32(PhysicalToVirtual(GpuRegister(kRegScratchAddr) + 4 * n), v);
+    }
   } else if (r == kRegCoherStatusHost) {
     // A coherency request: pending until a wait looks at it.
     SetReg(r, v | 0x80000000);
@@ -168,6 +174,7 @@ void Type3(Reader& in, uint32_t packet) {
       return;
     case kPm4Interrupt: {
       uint32_t cpus = in.Next();
+      LandResolves();
       for (uint32_t n = 0; n < 6; n++)
         if (cpus >> n & 1) Interrupt(1, n);
       return;
@@ -181,6 +188,7 @@ void Type3(Reader& in, uint32_t packet) {
       in.Next();
       uint32_t width = in.Next(), height = in.Next();
       in.Skip(count - 4);
+      LandResolves();
       QueueFrame(fetch, width, height);
       g_swaps++;
       g_counter++;
@@ -200,8 +208,12 @@ void Type3(Reader& in, uint32_t packet) {
         if (info & 0x10) {
           value = GpuRead(poll);
         } else {
-          // Caches here are always coherent: a request completes when looked at.
-          if (poll == kRegCoherStatusHost && GpuRegister(poll) & 0x80000000) SetReg(poll, 0);
+          // A coherency request completes when looked at, the resolves
+          // before it landed.
+          if (poll == kRegCoherStatusHost && GpuRegister(poll) & 0x80000000) {
+            LandResolves();
+            SetReg(poll, 0);
+          }
           value = GpuRegister(poll);
         }
         if (Match(value & mask, ref, info)) return;
@@ -253,10 +265,12 @@ void Type3(Reader& in, uint32_t packet) {
       SetReg(kRegVgtEventInitiator, initiator & 0x3F);
       if (initiator >> 31) value = g_counter.load();
       uint32_t base = GpuRegister(kRegWritebackStart), offset = (addr & ~3u) - base;
-      if (addr > 0x1FFFFFFF && base && offset < GpuRegister(kRegWritebackSize))
+      if (addr > 0x1FFFFFFF && base && offset < GpuRegister(kRegWritebackSize)) {
+        LandResolves();
         Wr32(0x7F000000 + offset, Bswap(GpuSwap(value, addr)));
-      else
+      } else {
         GpuWrite(addr, value);
+      }
       return;
     }
     case kPm4EventWriteExt: {
@@ -276,6 +290,7 @@ void Type3(Reader& in, uint32_t packet) {
       // queried for visible, as EVENT_WRITE_EXT reports the largest extent.
       SetReg(kRegVgtEventInitiator, in.Next() & 0x3F);
       if (uint32_t pa = GpuRegister(kRegRbSampleCountAddr)) {
+        LandResolves();
         uint32_t va = PhysicalToVirtual(pa & 0x1FFFFFFC);
         bool end = false;
         for (uint32_t k = 2; k < 6; k++) end |= Rd32(va + 4 * k) == kQueryEndMark;
@@ -389,6 +404,7 @@ void CommandProcessor(void*) {
     idle = 0;
     Reader in{va, size, rptr, (wptr + size - rptr) % size};
     while (in.remaining) Execute(in);
+    LandResolves();
     std::lock_guard<std::mutex> g(g_ring_lock);
     if (g_ring_dwords != size) continue;  // set up again meanwhile
     g_rptr = wptr;

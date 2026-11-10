@@ -18,9 +18,14 @@ constexpr uint32_t kEdramTiles = 2048, kEdramTileWords = 80 * 16,
 void StartEdram();
 
 // A draw packet with RB_MODECONTROL in copy mode: the resolve the copy
-// registers describe, from the command processor. Its results are in
-// memory when it returns.
+// registers describe, from the command processor. Its results reach
+// memory later, by LandResolves at the latest.
 void Resolve();
+
+// From the command processor, before anything the guest can see of the
+// GPU's progress (memory it writes or reads, interrupts, the read
+// pointer, a swap): the results of the resolves before it, in memory.
+void LandResolves();
 
 // Byte offset of block (x, y) in a 2D tiled surface `pitch` blocks wide
 // (a multiple of 32), blocks of 1 << bpb_log2 bytes; negative coordinates

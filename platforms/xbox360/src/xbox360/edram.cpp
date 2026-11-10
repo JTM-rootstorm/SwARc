@@ -211,6 +211,15 @@ struct State {
 };
 State* g_state;
 
+// The physical ranges of the resolves whose results are still on the
+// device (the command processor's).
+struct Range {
+  uint32_t lo, hi;
+};
+std::vector<Range> g_pending;
+// More would only hold transfer memory: no resolve waits until then.
+constexpr size_t kMaxPending = 32;
+
 State& Device() {
   if (g_state) return *g_state;
   auto s = std::make_unique<State>();
@@ -332,8 +341,9 @@ Rect ResolveRect(uint32_t surface_pitch) {
 }
 
 void Dispatch(State& s, gfx::ProgramId prog, const Rect& r, const void* uniforms,
-              const gfx::BufferData* in, gfx::RwBufferData* out) {
+              const gfx::BufferData* in, gfx::RwBufferData* out, bool land_later = false) {
   gfx::ProgramDispatch d;
+  d.land_later = land_later;
   d.program = prog;
   d.groups[0] = uint32_t(r.x1 - r.x0 + 7) / 8;
   d.groups[1] = uint32_t(r.y1 - r.y0 + 7) / 8;
@@ -344,6 +354,13 @@ void Dispatch(State& s, gfx::ProgramId prog, const Rect& r, const void* uniforms
 }
 
 }  // namespace
+
+void LandResolves() {
+  if (g_pending.empty()) return;
+  std::lock_guard<std::mutex> l(HostDeviceLock());
+  HostDevice().LandWrites(true);
+  g_pending.clear();
+}
 
 void StartEdram() {
   std::lock_guard<std::mutex> l(HostDeviceLock());
@@ -368,8 +385,6 @@ void Resolve() {
   if (command > 1) Fatal(nullptr, "GPU: resolve copy command %u", command);
   Rect r = ResolveRect(surface & 0x3FFF);
   if (r.x1 <= r.x0 || r.y1 <= r.y0) return;
-  std::lock_guard<std::mutex> l(HostDeviceLock());
-  State& s = Device();
   uint32_t shift_x = msaa == 2, shift_y = msaa >= 1, samples = 1u << msaa;
   // The pitch in 32bpp tiles: 80 samples each.
   uint32_t pitch_tiles = (((surface & 0x3FFF) << shift_x) + 79) / 80;
@@ -378,8 +393,6 @@ void Resolve() {
   uint32_t color_info = GpuRegister(kColorInfo[src_select & 3]), depth_info = GpuRegister(kRegRbDepthInfo);
   uint32_t color_format = color_info >> 16 & 0xF;
   bool wide = !depth && (color_format == 5 || color_format == 7 || color_format == 15);
-  gfx::BufferData edram_in{nullptr, kEdramBytes, s.edram, 0};
-  gfx::RwBufferData edram_out{nullptr, kEdramBytes, s.edram, false};
 
   // The copy: one sample into the tiled destination, as its words where
   // the formats agree (the target's swap of red and blue), else converted.
@@ -415,6 +428,17 @@ void Resolve() {
                 (0x400u << bpb_log2);
   if (lo >= kPhysicalSize || hi > kPhysicalSize || hi <= lo)
     Fatal(nullptr, "GPU: a resolve to %x-%x, outside physical memory", lo, hi);
+  // The copy reads the whole range and writes all of it back, the bytes
+  // outside the rectangle as they were: one that overlaps an earlier
+  // resolve's waits for its results.
+  bool overlaps = g_pending.size() >= kMaxPending;
+  for (const Range& p : g_pending) overlaps |= p.lo < hi && lo < p.hi;
+  if (overlaps) LandResolves();
+  g_pending.push_back({lo, hi});
+  std::lock_guard<std::mutex> l(HostDeviceLock());
+  State& s = Device();
+  gfx::BufferData edram_in{nullptr, kEdramBytes, s.edram, 0};
+  gfx::RwBufferData edram_out{nullptr, kEdramBytes, s.edram, false};
   uint32_t info = depth ? depth_info : color_info,
            flags = (wide ? 1 : 0) | (depth ? 2 : 0) | (wide_out ? 4 : 0) | (convert ? 8 : 0);
   float scale = std::ldexp(1.0f, exp_bias);
@@ -431,7 +455,7 @@ void Resolve() {
           {int32_t(dest_pitch), int32_t(bpb_log2), int32_t(dest_base - lo), 0},
           {color_format, format, scale_bits, 0}};
   gfx::RwBufferData dest{Mem() + PhysicalToVirtual(lo), hi - lo, 0, false};
-  Dispatch(s, s.copy, r, &cu, &edram_in, &dest);
+  Dispatch(s, s.copy, r, &cu, &edram_in, &dest, true);
 
   // Then the clears, of every sample in the rectangle.
   struct {

@@ -111,8 +111,19 @@ none of it has been checked on a console yet.
   of 32x32 texels in rows of pitch / 32, micro tiles of 8x2, with bank
   ((y >> 4) & 1) and pipe (((x >> 3) & 3) ^ ((y >> 3) & 1) << 1) bits
   interleaved into the offset.
-- The resolve runs as compute on the host GPU and its texels are in
-  memory when the packet is done; the device exists from power-on.
+- The resolve runs as compute on the host GPU (the device exists from
+  power-on), which reads the destination's range of memory (from the
+  first texel's 32x32 block to the end of the last's) and writes all of
+  it back, the bytes outside the rectangle as they were. Its texels
+  reach memory later, before anything the guest sees of the GPU's
+  progress that comes after it: a packet that writes or reads memory, an
+  interrupt, a coherency request that WAIT_REG_MEM looks at, a swap, the
+  read pointer. A resolve whose range overlaps one still on the device
+  waits for that one's texels first. On the console the texels are
+  written as the copy runs; a title that reads them without a fence or
+  writes into the range while the resolve runs would see the difference
+  (a choice, so that the command processor does not wait for the host
+  GPU after each resolve).
 
 ## Presentation
 - A swap packet shows its front buffer: the texture fetch constant the

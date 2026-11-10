@@ -1014,9 +1014,9 @@ static u32 ResolveAt(volatile u32* rb, u32 w, u32 verts, u32 control, u32 dest, 
 }
 
 static void Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
-  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x10000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
-  u32 scratch = pmem, dest = pmem + 0x4000, depth = pmem + 0x8000;
-  for (u32 k = 0; k < 0x3000; k++) *At(mem + 4 * k) = 0xAAAAAAAA;
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x14000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  u32 scratch = pmem, dest = pmem + 0x4000, depth = pmem + 0x8000, twice = pmem + 0x10000;
+  for (u32 k = 0; k < 0x5000; k++) *At(mem + 4 * k) = 0xAAAAAAAA;
   // The rectangles' corners, pixel centres at integers (PA_SU_VTX_CNTL 0):
   // the whole 64x64 target, and 8x8 at (8, 16).
   volatile float* v = (volatile float*)(uintptr_t)(mem + 0xC000);
@@ -1055,13 +1055,29 @@ static void Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
   // The target, red and blue swapped, bytes in words swapped (so this
   // big-endian CPU reads the swapped value).
   w = ResolveAt(rb, w, whole, 0, dest, 1u << 24 | 6 << 7 | 2);
+  // The target to another texture, cleared to C, and then the block (now
+  // C) to it too: the second resolve's 32x32 texels around the block
+  // keep what the first wrote.
+  rb[w++] = Type0(0x231E, 1);
+  rb[w++] = 0x99AABBCC;
+  w = ResolveAt(rb, w, whole, 0x100, twice, 6 << 7);
+  w = ResolveAt(rb, w, block, 0, twice, 6 << 7);
   // The depth target cleared, then copied.
   w = ResolveAt(rb, w, whole, 0x204, scratch, 6 << 7);
   w = ResolveAt(rb, w, whole, 4, depth, 6 << 7 | 2);
+  // A fence, then a wait on SCRATCH_REG1, a register, which holds the
+  // GPU until the texels are checked: they are in memory by the fence,
+  // not only by the end of the commands.
   rb[w++] = Type3(0x58, 3);
   rb[w++] = 0;
   rb[w++] = (pdata + 0x68) | 2;
   rb[w++] = 5;
+  rb[w++] = Type3(0x3C, 5);
+  rb[w++] = 3;
+  rb[w++] = 0x579;
+  rb[w++] = 1;
+  rb[w++] = 0xFFFFFFFF;
+  rb[w++] = 0x100;
   *Reg(0x1C5) = w;
   CHECK(WaitFor(At(data + 0x68), 5));
   // A is 11223344 (8888 as the EDRAM holds it, red in the low byte), B
@@ -1081,6 +1097,16 @@ static void Resolves(volatile u32* rb, u32 w, u32 data, u32 pdata) {
   u32 d = 0;
   for (u32 k = 0; k < 0x1000; k++) d += *At(mem + 0x8000 + 4 * k) == 0xABCDEF01;
   CHECK(d == 4096);
+  // In this one, words as the EDRAM holds them: A, and C in the block.
+  u32 c = 0;
+  a = 0;
+  for (u32 k = 0; k < 0x1000; k++) {
+    u32 t = *At(mem + 0x10000 + 4 * k);
+    a += t == 0x44332211;
+    c += t == 0xCCBBAA99;
+  }
+  CHECK(a == 4096 - 64 && c == 64);
+  *Reg(0x579) = 1;
 
   // The resolved texture as the front buffer, twice: tiled, a 64-texel
   // pitch, 64x64, its words byte-swapped (endian 2) and the swizzle ZYXW,
