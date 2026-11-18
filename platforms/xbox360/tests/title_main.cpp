@@ -11,7 +11,9 @@
 // back, so it is not set before). A speed with bit 15 set marks a point
 // of its GPU checks: from the last mark (0x8000 only sets one), resolves
 // landed n times in all (bits 10-14), n by draws' and packets' reads of
-// memory a resolve wrote (5-9) and draws loaded n host targets (0-4).
+// memory a resolve wrote (5-9) and draws loaded n host targets (0-4);
+// where the high-frequency speed has bit 15 set too, loads drew n
+// stencil bits (its bits 0-7) and stores n (8-14).
 
 #include <SDL3/SDL.h>
 
@@ -35,26 +37,32 @@ std::deque<uint16_t> g_requests;
 uint16_t g_last = 0;
 
 // The GPU counters at the last mark.
-uint64_t g_landings, g_overlap_landings, g_loads;
+uint64_t g_landings, g_overlap_landings, g_loads, g_load_bits, g_store_bits;
 
-void Mark(uint16_t m) {
+void Mark(uint16_t m, uint16_t bits) {
   using namespace recomp::xbox360;
   uint64_t a = ResolveLandings() - g_landings, b = ResolveOverlapLandings() - g_overlap_landings,
-           c = TargetLoads() - g_loads;
+           c = TargetLoads() - g_loads, d = StencilBitDraws(false) - g_load_bits,
+           e = StencilBitDraws(true) - g_store_bits;
   if (m != 0x8000 && (a != (m >> 10 & 31u) || b != (m >> 5 & 31u) || c != (m & 31u)))
     std::fprintf(stderr, "FAIL: GPU mark %04x: %llu landings, %llu by reads, %llu target loads\n", m,
                  (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
+  if (bits & 0x8000 && (d != (bits & 255u) || e != (bits >> 8 & 127u)))
+    std::fprintf(stderr, "FAIL: GPU mark %04x %04x: %llu stencil bits loaded, %llu stored\n", m, bits,
+                 (unsigned long long)d, (unsigned long long)e);
   g_landings += a;
   g_overlap_landings += b;
   g_loads += c;
+  g_load_bits += d;
+  g_store_bits += e;
 }
 
 // Called by SDL inside the title's XamInputSetState: a mark is checked at
 // once, other requests are carried out on the harness's own thread.
-bool Rumble(void*, uint16_t low, uint16_t) {
+bool Rumble(void*, uint16_t low, uint16_t high) {
   std::lock_guard<std::mutex> g(g_lock);
   if (low & 0x8000) {
-    if (low != g_last) Mark(low);
+    if (low != g_last) Mark(low, high);
     g_last = low;
     return true;
   }

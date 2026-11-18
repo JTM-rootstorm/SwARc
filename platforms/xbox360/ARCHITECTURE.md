@@ -287,10 +287,13 @@ and titles see of the Xenos, and its draws (docs/xenos.md):
   mapped to the host's, drawing into a host image per EDRAM colour or
   depth target, MSAA supersampled. A target loads its rows from the
   EDRAM buffer before the draws into it that need them (a draw that
-  writes the depth, stencil a bit at a time), and stores into it before
-  a resolve or before an overlapping target is drawn into (compute,
-  stencil read back through stencil tests); a resolve's clear clears
-  the host target it covers and makes the others there load again.
+  writes the depth; the stencil only where the EDRAM's tiles there are
+  known to hold one value, else when a draw first tests it, a bit at a
+  time), and stores into it before a resolve or before an overlapping
+  target is drawn into (compute, stencil read back through stencil
+  tests where a draw wrote it, else the EDRAM's stencil bytes kept); a
+  resolve's clear clears the host target it covers and makes the others
+  there load again.
   Draws outside what is implemented (docs/xenos.md, "Drawing") are
   fatal.
 - Textures (`texture.{h,cpp}`) are decoded on the CPU from guest memory

@@ -27,11 +27,16 @@ void StoreTargets();
 // EDRAM words `lo` and (64bpp) `hi`, from the command processor with the
 // display device's lock held: a host target of that surface whose rows
 // in use and width it covers takes the clear itself; others whose tiles
-// it touches load again before the next draw into them.
+// it touches load again before the next draw into them. The stencil the
+// EDRAM's tiles hold where known (which spares a depth target's load its
+// draws of each stencil bit) follows the clear.
 void ClearTargets(bool depth, uint32_t base, uint32_t width, uint32_t pitch, uint32_t msaa, uint32_t format,
                   int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t lo, uint32_t hi);
 // How many times draws loaded a host target from the EDRAM, for the test
 // harness.
 uint64_t TargetLoads();
+// How many draws of one stencil bit each loads (stores: stores) of depth
+// targets made, for the test harness.
+uint64_t StencilBitDraws(bool stores);
 
 }  // namespace recomp::xbox360

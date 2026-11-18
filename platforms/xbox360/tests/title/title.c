@@ -2029,15 +2029,18 @@ static void Textures(void) {
 // A mark of the GPU checks for the test program (title_main.cpp): since
 // the last mark, resolves landed `landings` times, `reads` of them for
 // the GPU's reads of memory a resolve wrote, and draws loaded `loads`
-// host targets; Mark(-1, ...) only sets one. From an idle GPU (after
-// Kick).
-static void Mark(int landings, u32 reads, u32 loads) {
+// host targets; Mark(-1, ...) only sets one. MarkStencil checks too that
+// loads drew `load_bits` stencil bits (unless negative) and stores
+// `store_bits`. From an idle GPU (after Kick).
+static void MarkStencil(int landings, u32 reads, u32 loads, int load_bits, u32 store_bits) {
   uint16_t vibration[2] = {
-      (uint16_t)(landings < 0 ? 0x8000 : 0x8000 | (u32)landings << 10 | reads << 5 | loads), 0};
+      (uint16_t)(landings < 0 ? 0x8000 : 0x8000 | (u32)landings << 10 | reads << 5 | loads),
+      (uint16_t)(load_bits < 0 ? 0 : 0x8000 | store_bits << 8 | (u32)load_bits)};
   XamInputSetState(0, 0, vibration);
-  vibration[0] = 0;
+  vibration[0] = vibration[1] = 0;
   XamInputSetState(0, 0, vibration);
 }
+static void Mark(int landings, u32 reads, u32 loads) { MarkStencil(landings, reads, loads, -1, 0); }
 
 // Resolves into textures the cache holds, sampled before and after: those
 // whose level 0 is the copy's destination, in a format that decodes its
@@ -2404,6 +2407,248 @@ static void InPlace(void) {
 #undef SCRATCH
 }
 
+// Depth targets' stencil on the host: loaded from the EDRAM's words only
+// when a draw tests it (where the EDRAM's tiles are known to hold one
+// value, with the depth, drawing no stencil bit), and stored only where a
+// draw wrote it (else the EDRAM's words keep their stencil bytes). Two
+// surfaces over depth tiles 0x780-0x787, each loading what the other
+// left: A, 4x MSAA 40 pixels wide (a tile's 80 samples a row: its clears
+// cover whole tiles), colour at 0x7D0; B, 2x MSAA 64 pixels wide (part of
+// each tile), colour at 0x7C0. A pixel (x, y) is depth sample (2x, 2y) of
+// A's, (x, 2y) of B's.
+static void StencilLoads(void) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x80000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  for (u32 k = 0; k < 0x80000; k += 4) *At(mem + k) = 0;
+  gq.used = 0;
+  u32 slot = pmem + 0x40000;
+#define SCRATCH (slot += 0x4000)
+#define OUT(k) (pmem + 0x4000 * (k))
+  const u32 surface_a = 40 | 2 << 16, surface_b = 64 | 1 << 16;
+  // (a) A's depth cleared to stencil 0xA5, B's colour to 0; B white where
+  // the stencil is 0xA5 (8-16, 8-16), and where it is 0xA4 (24-32): its
+  // depth loads tiles known to hold 0xA5, with no stencil bit.
+  Set(0x2000, surface_a);
+  Set(0x2002, 0x780);
+  Set(0x231D, 0xFFFFFFA5);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x231E, 0);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+  PixelShader(0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(8, 8, 16, 16, 0, kWhite);
+  Set(0x210D, 0xA4 | 0xFF << 8);
+  Rect(24, 8, 32, 16, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(0), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 2, 0, 0);
+  // (b) B's stencil replaced by 0x3C at rows 32-48 (its pixels 0-64),
+  // stored a bit at a time (8); A's colour cleared, its depth loaded
+  // without its stencil, which A's first stencil test loads a bit at a
+  // time (8); red where the stencil is 0xA5, green where 0x3C (A's pixels
+  // 32-40 are past B's 64 columns: red). A's store keeps the EDRAM's
+  // stencil bytes (none).
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Set(0x210D, 0x3C | 0xFF << 16);
+  Rect(0, 32, 64, 48, 0, kBlack);
+  Set(0x2200, 0);
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kRed);
+  Set(0x210D, 0x3C | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kGreen);
+  Set(0x2200, 0);
+  Resolve(0, OUT(1), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 2, 8, 8);
+  // (c) A's depth cleared to 0xA5 again (all its tiles known); colour
+  // target 0x780 of B in 0x33 at rows 0-8, over them: B's depth loads,
+  // and its stencil test draws each bit (8); white where the stencil is
+  // 0x33 (rows 0-8), in 0x7C0. No store draws any (none written).
+  Set(0x231D, 0xFFFFFFA5);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x780);
+  const float c_33[4] = {0.2f, 0.2f, 0.2f, 0.2f};
+  Rect(0, 0, 64, 8, 0, c_33);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x33 | 0xFF << 8);
+  Rect(0, 0, 64, 16, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(2), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 2, 8, 0);
+  // (d) B's depth cleared to 0x5A: its 64 columns, part of each tile; A's
+  // stencil test loads each bit (8): blue where the stencil is 0x5A,
+  // white where 0xA5 (A's pixels 32-40, below the 0x33 rows).
+  Set(0x231D, 0xFFFFFF5A);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x5A | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kBlue);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(3), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (e) A's depth cleared (depth 1, stencil 0xA5), 0x3C replaced at its
+  // rows 32-48, stored. Then B, without a stencil test: its depth loads
+  // with no stencil bit, depth 0.5 drawn at (8-24, 8-24), stored with
+  // none either, A's depth resolved: B's depth over A's stencil bytes
+  // (A's pixel (8, 12): 0x800000A5; (8, 40): 0xFFFFFF3C). A's stencil
+  // tests then load its stencil (8): green where 0x3C, red where 0xA5.
+  Set(0x231D, 0xFFFFFFA5);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Set(0x210D, 0x3C | 0xFF << 16);
+  Rect(0, 32, 40, 48, 0, kBlack);
+  Set(0x2200, 0);
+  Resolve(0, SCRATCH, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Rect(8, 8, 24, 24, 0.5f, kBlack);
+  Set(0x2200, 0);
+  Set(0x2000, surface_a);
+  Resolve(4, OUT(4), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 0, 0);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x3C | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kGreen);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kRed);
+  Set(0x2200, 0);
+  Resolve(0, OUT(5), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (f) B's depth loads without its stencil; depth 0.25 drawn at (32-48,
+  // 8-24); then blue where the stencil is 0xA5 and the depth less than
+  // 0.375: the test loads the stencil (8), the depth as drawn (not at
+  // 32-48, nor at rows 32-48 where the stencil is 0x3C).
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Rect(32, 8, 48, 24, 0.25f, kBlack);
+  Set(0x2200, 1 | 2 | 1 << 4 | 2 << 8);
+  Rect(0, 0, 64, 64, 0.375f, kBlue);
+  Set(0x2200, 0);
+  Resolve(0, OUT(6), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (g) A's depth loads without its stencil; 0x77 replaced at its rows
+  // 0-16 (the test loads the stencil first: 8); stored a bit at a time
+  // (8) by the resolve of A's depth (0xFFFFFF77 at (6, 6); B's depth 0.5
+  // over 0xA5 at (6, 20)). B's test then loads it (8): white where it is
+  // 0x77, at B's rows 0-16.
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Set(0x210D, 0x77 | 0xFF << 16);
+  Rect(0, 0, 40, 16, 0, kBlack);
+  Set(0x2200, 0);
+  Resolve(4, OUT(7), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 8);
+  Set(0x2000, surface_b);
+  Set(0x2001, 0x7C0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x77 | 0xFF << 8);
+  Rect(0, 0, 64, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(8), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 8, 0);
+  // (h) C, 64 pixels wide without MSAA (sample (x, y) of pixel (x, y)),
+  // colour at 0x7E0, the window's rows 0-32: white where the stencil is
+  // 0x77 (its rows 0-32), the test loading it (8); then the window's
+  // rows 0-64: the rows added load with their stencil at once (8), white
+  // where it is 0xA5 (rows 32-64). Its colour and depth load twice each.
+  Set(0x2000, 64);
+  Set(0x2001, 0x7E0);
+  Set(0x2082, 64 | 32 << 16);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0x77 | 0xFF << 8);
+  Rect(0, 0, 64, 32, 0, kWhite);
+  Set(0x2082, 64 | 64 << 16);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 32, 64, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, OUT(9), 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 4, 16, 0);
+  // (i) A's depth loads (its Z test on, Always) without its stencil;
+  // white where the stencil test is on but Always and Keep (as if off: no
+  // stencil bit); then red where the stencil is 0xA5 (A's rows 16-32),
+  // which loads it (8).
+  Set(0x2000, surface_a);
+  Set(0x2001, 0x7D0);
+  Set(0x2200, 1 | 2 | 7 << 4 | 7 << 8);
+  Set(0x210D, 0xFFFF00);
+  Rect(0, 0, 40, 64, 0, kWhite);
+  Set(0x2200, 0);
+  Resolve(0, SCRATCH, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 1, 0, 0);
+  Set(0x2200, 1 | 2 << 8);
+  Set(0x210D, 0xA5 | 0xFF << 8);
+  Rect(0, 0, 40, 64, 0, kRed);
+  Set(0x2200, 0);
+  Resolve(0, OUT(10), 6 << 7 | 2, 0);
+  Set(0x2000, 64);
+  Set(0x2001, 0x200);
+  Set(0x2002, 0x500);
+  Kick();
+  gq.used = 0;
+  MarkStencil(1, 0, 0, 8, 0);
+  volatile u32* t = At(mem);
+#define T(k, x, y) t[0x1000 * (k) + Tiled64(x, y, 2) / 4]
+  CHECK(T(0, 12, 12) == 0xFFFFFFFF && T(0, 28, 12) == 0 && T(0, 4, 4) == 0);
+  CHECK(T(1, 8, 8) == 0xFF0000FF && T(1, 8, 40) == 0xFF00FF00 && T(1, 36, 40) == 0xFF0000FF);
+  CHECK(T(2, 40, 4) == 0xFFFFFFFF && T(2, 40, 12) == 0);
+  CHECK(T(3, 8, 20) == 0xFFFF0000 && T(3, 36, 20) == 0xFFFFFFFF);
+  CHECK(T(4, 8, 12) == 0x800000A5 && T(4, 8, 40) == 0xFFFFFF3C);
+  CHECK(T(5, 8, 8) == 0xFF0000FF && T(5, 8, 40) == 0xFF00FF00);
+  CHECK(T(6, 16, 16) == 0xFFFF0000 && T(6, 56, 56) == 0xFFFF0000 && T(6, 40, 16) != 0xFFFF0000 &&
+        T(6, 16, 40) != 0xFFFF0000);
+  CHECK(T(7, 6, 6) == 0xFFFFFF77 && T(7, 6, 20) == 0x800000A5);
+  CHECK(T(8, 12, 6) == 0xFFFFFFFF && T(8, 12, 20) != 0xFFFFFFFF);
+  CHECK(T(9, 20, 16) == 0xFFFFFFFF && T(9, 20, 48) == 0xFFFFFFFF);
+  CHECK(T(10, 6, 6) == 0xFFFFFFFF && T(10, 6, 40) == 0xFFFFFFFF && T(10, 20, 24) == 0xFF0000FF);
+  MmFreePhysicalMemory(0, mem);
+#undef T
+#undef OUT
+#undef SCRATCH
+}
+
 // Draws into colour and depth targets, resolved and read back: a vertex
 // shader that fetches a position (x, y, z) and a colour and exports them,
 // pixel shaders that export the colour interpolated or float constants.
@@ -2750,6 +2995,7 @@ static void Draws(volatile u32* rb, u32 w, u32 data, u32 pdata) {
   Primitives();
   Textures();
   InPlace();
+  StencilLoads();
 }
 
 // Waits up to a second for *p == v.

@@ -514,12 +514,32 @@ been checked on a console yet.
   D24FS8 the 20e4 float (4 exponent bits biased by 15, 20 mantissa
   bits, [0, 2); stored rounded to the nearest even, loaded at most 1).
   A depth tile's two 40-sample halves are swapped, as resolves read
-  them. The host samples depth but not stencil: stencil is loaded a
-  bit at a time (eight passes setting one bit where the EDRAM's is set)
-  and read back the same way into an 8-bit image, by stencil tests;
-  where a depth target's stencil is known to be one value in all its
-  rows in use (after a clear of it, until a load or a draw whose stencil
-  test can write it), it is stored as that value without the passes.
+  them. The host samples depth but not stencil, so stencil moves only
+  where it is used or changed. The renderer keeps, for each EDRAM tile,
+  the stencil all its words hold where it is known: the EDRAM starts
+  zeroed; a store that writes a known stencil, or a resolve's depth
+  clear, sets the tiles it writes all of to that value and keeps the
+  others it touches only where they held it already; a store that
+  writes a stencil read back, a colour store and a colour clear make
+  the tiles they touch unknown. A depth load writes the depth, and the
+  stencil where the tiles all hold one known value; otherwise the
+  target's stencil is not loaded: a target that is valid holds what the
+  EDRAM holds but for what draws changed (any other writer of its tiles
+  stores it and makes it stale first), so the EDRAM's words hold its
+  stencil until a draw writes it, and a draw that writes it tests it.
+  A stencil test that can neither fail nor write (compare Always for
+  each face in use, and a write mask of 0 or Keep where it passes and
+  where the depth fails) is drawn as if off. The first draw with the
+  stencil test on loads it, for all the rows in use: the known value,
+  or the stencil cleared and then a bit at a time
+  (eight passes setting one bit where the EDRAM's is set), leaving the
+  depth as it is. Rows added to a target whose stencil is loaded load
+  theirs at once. A store writes the depth over the EDRAM words'
+  stencil bytes as they are unless a draw wrote the stencil since the
+  target last matched the EDRAM; then it writes the known value, or the
+  stencil read back the same way, a bit at a time into an 8-bit image,
+  by stencil tests. This is the host's bookkeeping only: what the EDRAM
+  holds is the same.
 
 ## Presentation
 - A swap packet shows its front buffer: the texture fetch constant the

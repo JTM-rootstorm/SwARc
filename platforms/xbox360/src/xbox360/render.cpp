@@ -360,6 +360,7 @@ std::string PixelMain(const ShaderInfo& p) {
 // (at most the host's 4096), so the targets one surface binds are all of
 // one size. A sample (x, y) is the EDRAM word EdramWord gives for pixel
 // (x, y) without sample shifts: the layout resolves read.
+constexpr int kStencilLoaded = -1, kStencilUnloaded = -2;
 struct Target {
   bool depth;
   uint32_t base, pitch, msaa, format;  // base tile, pitch in 32bpp tiles, RB_SURFACE_INFO's MSAA, format
@@ -371,9 +372,20 @@ struct Target {
   bool valid = false;  // holds what the EDRAM holds (in its rows in use)
   bool dirty = false;  // drawn into since its last store
   uint32_t rows = 0;   // in use: what draws' scissors reach
-  int stencil = -1;    // a depth target's stencil in all those rows, where known (a clear)
+  // A depth target's stencil in its rows in use: one value all of them
+  // hold, where known (>= 0); loaded per sample (kStencilLoaded); or not
+  // loaded (kStencilUnloaded): the host image's is not used, the EDRAM's
+  // words hold it. They do while no draw has written it (stencil_dirty):
+  // a valid target holds what the EDRAM holds in those rows but for what
+  // draws changed, as any other writer of their tiles first stores the
+  // target and makes it not valid; and a draw that writes the stencil
+  // tests it, which loads it first.
+  int stencil = kStencilUnloaded;
+  bool stencil_dirty = false;  // a draw wrote the stencil since it last matched the EDRAM's
 };
-std::atomic<uint64_t> g_loads;  // read by the test harness
+// Read by the test harness: loads, and the draws of one stencil bit each
+// that loads and stores make.
+std::atomic<uint64_t> g_loads, g_load_bits, g_store_bits;
 
 // The host format of each colour target format: 8_8_8_8 as unorm (the
 // gamma one holding the gamma values, as Xenia does); 2_10_10_10 as unorm;
@@ -464,7 +476,7 @@ void main() { xe_out = vec4(float(1 << r.x) / 255.0); }
 const char kStoreUniforms[] = R"(
 layout(R_UNIFORMS) uniform U {
   uvec4 t;  // base, pitch, format, 64bpp
-  ivec4 r;  // width, first row, end row, the stencil where known (else -1)
+  ivec4 r;  // width, first row, end row, the stencil: where known; -1 its image's; -2 the EDRAM's kept
 };
 )";
 const char kStoreColor[] = R"(
@@ -486,9 +498,12 @@ void main() {
   ivec2 p = ivec2(gl_GlobalInvocationID.xy) + ivec2(0, r.y);
   if (p.x >= r.x || p.y >= r.z) return;
   float d = texelFetch(xe_depth, ivec3(p, 0), 0).r;
-  uint s = r.w >= 0 ? uint(r.w) : uint(texelFetch(xe_stencil, p, 0).r * 255.0 + 0.5);
+  uint w = r_rwbuf[0].x + EdramWord(p, 0u, t.x, t.y, uvec2(0u), false, true);
+  uint s = r.w >= 0    ? uint(r.w)
+           : r.w == -1 ? uint(texelFetch(xe_stencil, p, 0).r * 255.0 + 0.5)
+                       : r_rw[w] & 0xFFu;
   uint d24 = t.z == 0u ? F32ToUnorm24(d) : F32To20e4(d);
-  r_rw[r_rwbuf[0].x + EdramWord(p, 0u, t.x, t.y, uvec2(0u), false, true)] = d24 << 8 | s;
+  r_rw[w] = d24 << 8 | s;
 }
 )";
 
@@ -500,6 +515,10 @@ struct State {
   std::map<std::tuple<const Shader*, const Shader*, Kind, uint64_t>, gfx::ProgramId> programs;
   gfx::ProgramId load_color = 0, load_depth = 0, stencil_bit = 0, store_color = 0, store_depth = 0;
   std::vector<std::unique_ptr<Target>> targets;
+  // Each EDRAM tile's stencil: the low byte all its words hold, as a depth
+  // target reads them, where known (else -1). The buffer starts zeroed;
+  // stores and resolves' clears, its only writers, keep this.
+  int16_t tile_stencil[kEdramTiles] = {};
 };
 State g_state;
 
@@ -510,6 +529,30 @@ bool Overlap(const Target& a, uint32_t a_rows, const Target& b, uint32_t b_rows)
   uint32_t an = Tiles(a, a_rows), bn = Tiles(b, b_rows);
   if (!an || !bn) return false;
   return ((b.base - a.base) & (kEdramTiles - 1)) < an || ((a.base - b.base) & (kEdramTiles - 1)) < bn;
+}
+
+// A write of stencil v (-1: unknown, or not depth words) to samples
+// [x0, x1) x [y0, y1) of a target at base tile `base`, its rows of tiles
+// `row` tiles of `tile_w` samples: the tiles all of whose words it writes
+// hold v; others it touches keep v only where they held it.
+void TilesWritten(uint32_t base, uint32_t row, uint32_t tile_w, uint32_t x0, uint32_t y0, uint32_t x1,
+                  uint32_t y1, int v) {
+  if (x1 <= x0 || y1 <= y0) return;
+  for (uint32_t ty = y0 / 16; ty * 16 < y1; ty++)
+    for (uint32_t tx = x0 / tile_w; tx * tile_w < x1; tx++) {
+      int16_t& s = g_state.tile_stencil[(base + ty * row + tx) & (kEdramTiles - 1)];
+      bool all = x0 <= tx * tile_w && (tx + 1) * tile_w <= x1 && y0 <= ty * 16 && (ty + 1) * 16 <= y1;
+      s = int16_t(all || s == v ? v : -1);
+    }
+}
+// The stencil all the tiles of a depth target's rows [first, end) hold,
+// where it is one known value; else -1.
+int TilesStencil(const Target& t, uint32_t first, uint32_t end) {
+  int v = g_state.tile_stencil[(t.base + first / 16 * t.pitch) & (kEdramTiles - 1)];
+  for (uint32_t ty = first / 16; ty * 16 < end; ty++)
+    for (uint32_t tx = 0; tx < t.pitch; tx++)
+      if (g_state.tile_stencil[(t.base + ty * t.pitch + tx) & (kEdramTiles - 1)] != v) return -1;
+  return v;
 }
 
 gfx::ProgramId Make(gfx::ProgramId& id, const std::string& vs, const std::string& fs, uint32_t fs_buffers,
@@ -546,6 +589,37 @@ gfx::ProgramDraw FullDraw(gfx::ProgramId prog, const Target& t, uint32_t first, 
   return d;
 }
 
+// A depth target's rows [first, end) drawn from the EDRAM: the stencil
+// all v (v >= 0), else cleared, then each bit set; the depth too with the
+// first draw where `depth`, else left as it is (no depth test or write).
+void LoadStencil(Target& t, uint32_t first, uint32_t end, int v, bool depth) {
+  gfx::Device& dev = HostDevice();
+  struct {
+    uint32_t t[4];
+    int32_t r[4];
+  } u = {{t.base, t.pitch, t.format, 0}, {-1, 0, 0, 0}};
+  gfx::BufferData edram{nullptr, kEdramBytes, EdramBuffer(), 0};
+  std::string fs = std::string(kLoadUniforms) + kEdramGlsl + kHostScaleGlsl + kLoadDepth;
+  gfx::ProgramDraw d = FullDraw(Make(g_state.load_depth, kFullTargetVertex, fs, 1, 32), t, first, end);
+  d.depth = t.ds;
+  d.fs.buffers = &edram;
+  d.fs.uniforms = &u;
+  d.state.depth_test = d.state.depth_write = depth;
+  d.state.stencil = true;
+  d.state.stencil_front.pass = d.state.stencil_back.pass = gfx::StencilOp::Replace;
+  d.state.stencil_ref = uint8_t(std::max(v, 0));
+  dev.DrawProgram(d);
+  if (v >= 0) return;
+  d.state.depth_test = d.state.depth_write = false;
+  d.state.stencil_ref = 0xFF;
+  for (int bit = 0; bit < 8; bit++) {
+    u.r[0] = bit;
+    d.state.stencil_write_mask = uint8_t(1 << bit);
+    dev.DrawProgram(d);
+    g_load_bits++;
+  }
+}
+
 void Load(Target& t, uint32_t first, uint32_t end) {
   if (end <= first) return;
   g_loads++;
@@ -565,25 +639,19 @@ void Load(Target& t, uint32_t first, uint32_t end) {
     dev.DrawProgram(d);
     return;
   }
-  // The depth, and the stencil cleared; then each stencil bit set.
-  t.stencil = -1;
-  gfx::ProgramDraw d = FullDraw(Make(g_state.load_depth, kFullTargetVertex, fs + kLoadDepth, 1, 32), t, first, end);
-  d.depth = t.ds;
-  d.fs.buffers = &edram;
-  d.fs.uniforms = &u;
-  d.state.depth_test = true;
-  d.state.depth_write = true;
-  d.state.stencil = true;
-  d.state.stencil_front.pass = d.state.stencil_back.pass = gfx::StencilOp::Replace;
-  d.state.stencil_ref = 0;
-  dev.DrawProgram(d);
-  d.state.depth_write = false;
-  d.state.stencil_ref = 0xFF;
-  for (int bit = 0; bit < 8; bit++) {
-    u.r[0] = bit;
-    d.state.stencil_write_mask = uint8_t(1 << bit);
-    dev.DrawProgram(d);
+  // The depth; the stencil the EDRAM's tiles there all hold where it is
+  // known, else not loaded until a draw tests it. Rows added to a target
+  // whose stencil is loaded load theirs at once.
+  int v = TilesStencil(t, first, end);
+  bool bits = false;
+  if (!first) {
+    t.stencil = v >= 0 ? v : kStencilUnloaded;
+    t.stencil_dirty = false;
+  } else if (t.stencil != kStencilUnloaded && (v < 0 || t.stencil != v)) {
+    bits = v < 0;
+    t.stencil = kStencilLoaded;
   }
+  LoadStencil(t, first, end, bits ? -1 : std::max(v, 0), true);
 }
 
 void Store(Target& t) {
@@ -593,10 +661,14 @@ void Store(Target& t) {
     uint32_t t[4];
     int32_t r[4];
   } u = {{t.base, t.pitch, t.format, t.wide ? 1u : 0u}, {t.w, 0, int32_t(t.rows), t.stencil}};
+  // A depth target's stencil no draw wrote is the EDRAM's already: its
+  // words keep their low bytes, and the tiles their record.
+  bool keep = t.depth && !t.stencil_dirty;
+  if (keep) u.r[3] = -2;
   std::string cs = std::string(kStoreUniforms) + kEdramGlsl + kHostScaleGlsl;
   gfx::ProgramDispatch d;
   gfx::TextureId textures[2] = {t.image, 0};
-  if (t.depth && t.stencil < 0) {
+  if (t.depth && !keep && t.stencil < 0) {
     // The stencil into its image first, unless it is known.
     dev.ClearImage(t.stencil_image, 0, {0, 0, 0, 0});
     gfx::ProgramDraw s = FullDraw(Make(g_state.stencil_bit, kFullTargetVertex, kStencilBit, 0, 16), t, 0, t.rows);
@@ -613,6 +685,7 @@ void Store(Target& t) {
     for (; bit[0] < 8; bit[0]++) {
       s.state.stencil_read_mask = uint8_t(1 << bit[0]);
       dev.DrawProgram(s);
+      g_store_bits++;
     }
   }
   if (t.depth) {
@@ -629,7 +702,10 @@ void Store(Target& t) {
   d.cs.textures = textures;
   d.rw_buffers = &out;
   dev.DispatchProgram(d);
-  t.dirty = false;
+  if (!keep)
+    TilesWritten(t.base, t.pitch * (t.wide ? 2 : 1), t.wide ? 40 : 80, 0, 0, uint32_t(t.w), t.rows,
+                 t.depth ? t.stencil : -1);
+  t.dirty = t.stencil_dirty = false;
 }
 
 // The target of a surface's: found, or made.
@@ -1028,7 +1104,20 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
   if (pi.colors >> colors)
     Fatal(nullptr, "GPU: a pixel shader writes colour targets %x, not from 0 on (not implemented yet)", pi.colors);
   uint32_t depth_control = GpuRegister(kRegRbDepthControl);
-  bool z_enable = depth_control >> 1 & 1, stencil = depth_control & 1, depth = z_enable || stencil;
+  // A stencil test that can neither fail nor write is as if off: for each
+  // face in use (the back's own where bit 7 says), compare Always, and a
+  // write mask of 0 or Keep where it passes and where the depth fails.
+  // Without it or the Z test the draw does nothing to depth or stencil,
+  // so the depth target is not bound.
+  bool backface = depth_control >> 7 & 1;
+  auto no_op = [&](uint32_t at, uint32_t ref_mask) {
+    return (depth_control >> at & 7) == 7 &&
+           (!(ref_mask >> 16 & 0xFF) || !(depth_control >> (at + 6) & 7 || depth_control >> (at + 9) & 7));
+  };
+  bool z_enable = depth_control >> 1 & 1,
+       stencil = depth_control & 1 && !(no_op(8, GpuRegister(kRegRbStencilRefMask)) &&
+                                        (!backface || no_op(20, GpuRegister(kRegRbStencilRefMaskBf)))),
+       depth = z_enable || stencil;
   if (!colors && !depth) return;
 
   // The guest indices (counted from 0, or the packet's or memory's, with
@@ -1157,6 +1246,15 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
   uint32_t depth_info = GpuRegister(kRegRbDepthInfo), depth_format = depth_info >> 16 & 1;
   if (depth) bound.push_back(&GetTarget(true, depth_info & 0xFFF, pitch, msaa, depth_format));
   BindTargets(bound, uint32_t(std::max(sc.bottom, 0)));
+  // A stencil test reads the depth target's stencil, in all its rows in
+  // use as they now are: loaded first where it is not (by Target's
+  // reasoning the EDRAM's words still hold it).
+  if (depth && stencil && bound.back()->stencil == kStencilUnloaded) {
+    Target& t = *bound.back();
+    int v = TilesStencil(t, 0, t.rows);
+    LoadStencil(t, 0, t.rows, v, false);
+    t.stencil = v >= 0 ? v : kStencilLoaded;
+  }
   const Target& first = *bound[0];
 
   float extent[2] = {float(first.w), float(first.h)};
@@ -1277,7 +1375,6 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
     d.state.depth_write = z_enable && (depth_control >> 2 & 1);
     d.state.depth_compare = gfx::CompareOp(depth_control >> 4 & 7);
     d.state.stencil = stencil;
-    bool backface = depth_control >> 7 & 1;
     auto face = [&](gfx::StencilFace& f, uint32_t at) {
       f.compare = gfx::CompareOp(depth_control >> at & 7);
       f.fail = gfx::StencilOp(depth_control >> (at + 3) & 7);
@@ -1291,12 +1388,15 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
       Fatal(nullptr, "GPU: back faces with their own stencil reference or masks (not implemented yet)");
     d.state.stencil_ref = uint8_t(ref);
     d.state.stencil_read_mask = uint8_t(ref >> 8);
-    // A draw whose stencil test can write: its stencil no longer known.
+    // A draw whose stencil test can write: its stencil no longer known,
+    // nor the EDRAM's.
     auto writes = [](const gfx::StencilFace& f) {
       return f.fail != gfx::StencilOp::Keep || f.pass != gfx::StencilOp::Keep || f.depth_fail != gfx::StencilOp::Keep;
     };
-    if (stencil && ref >> 16 & 0xFF && (writes(d.state.stencil_front) || writes(d.state.stencil_back)))
-      bound.back()->stencil = -1;
+    if (stencil && ref >> 16 & 0xFF && (writes(d.state.stencil_front) || writes(d.state.stencil_back))) {
+      bound.back()->stencil = kStencilLoaded;
+      bound.back()->stencil_dirty = true;
+    }
     d.state.stencil_write_mask = uint8_t(ref >> 16);
     // Polygon offset (PA_SU_SC_MODE_CNTL bits 11-12), the front's unless
     // front faces are culled, as Xenia picks it: the offset in units of
@@ -1365,6 +1465,9 @@ void ClearTargets(bool depth, uint32_t base, uint32_t width, uint32_t pitch, uin
   cleared.pitch = pitch;
   cleared.wide = !depth && Wide(format);
   uint32_t rows = uint32_t(y1) << shift_y;
+  // The EDRAM's tiles the clear wrote, every sample of the rectangle.
+  TilesWritten(base, pitch * (cleared.wide ? 2 : 1), cleared.wide ? 40 : 80, uint32_t(x0) << shift_x,
+               uint32_t(y0) << shift_y, uint32_t(x1) << shift_x, rows, depth ? int(lo & 0xFF) : -1);
   for (auto& c : g_state.targets) {
     Target& t = *c;
     if (!Overlap(cleared, rows, t, t.rows)) continue;
@@ -1383,6 +1486,7 @@ void ClearTargets(bool depth, uint32_t base, uint32_t width, uint32_t pitch, uin
       float z = format == kDepthD24S8 ? Unorm24(lo >> 8) : std::min(F20e4(lo >> 8), 1.0f);
       dev.ClearDepth(t.ds, z, int(lo & 0xFF), 0);
       t.stencil = int(lo & 0xFF);
+      t.stencil_dirty = false;
     } else {
       dev.ClearImage(t.image, 0, LoadedColor(format, lo, hi));
     }
@@ -1392,5 +1496,6 @@ void ClearTargets(bool depth, uint32_t base, uint32_t width, uint32_t pitch, uin
 }
 
 uint64_t TargetLoads() { return g_loads; }
+uint64_t StencilBitDraws(bool stores) { return stores ? g_store_bits : g_load_bits; }
 
 }  // namespace recomp::xbox360
