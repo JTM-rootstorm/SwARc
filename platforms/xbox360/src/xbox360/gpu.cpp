@@ -199,6 +199,7 @@ void Type3(Reader& in, uint32_t packet) {
     case kPm4IndirectBuffer:
     case kPm4IndirectBufferPfd: {
       uint32_t pa = in.Next() & 0x1FFFFFFF, words = in.Next() & 0xFFFFF;
+      LandResolves(pa, pa + 4 * words);
       Reader ib{PhysicalToVirtual(pa), words ? words : 1, 0, words};
       while (ib.remaining) Execute(ib);
       return;
@@ -210,12 +211,13 @@ void Type3(Reader& in, uint32_t packet) {
         if (info & 0x10) {
           value = GpuRead(poll);
         } else {
-          // A coherency request completes when looked at, the resolves
-          // before it landed.
-          if (poll == kRegCoherStatusHost && GpuRegister(poll) & 0x80000000) {
-            LandResolves();
-            SetReg(poll, 0);
-          }
+          // A coherency request completes when looked at. It is for the
+          // GPU's own later reads of the memory resolves wrote, which take
+          // their results from the device or land them first
+          // (LandResolves(lo, hi)), so it lands nothing (a choice; a title
+          // that polled the register from the CPU and then read the
+          // texels without a fence would see them late; console check).
+          if (poll == kRegCoherStatusHost && GpuRegister(poll) & 0x80000000) SetReg(poll, 0);
           value = GpuRegister(poll);
         }
         if (Match(value & mask, ref, info)) return;
@@ -281,6 +283,7 @@ void Type3(Reader& in, uint32_t packet) {
       SetReg(kRegVgtEventInitiator, in.Next() & 0x3F);
       uint32_t va = PhysicalToVirtual(in.Next() & ~3u);
       const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
+      LandResolves();
       for (uint32_t k = 0; k < 6; k++) Wr16(va + 2 * k, extents[k]);
       return;
     }
@@ -350,7 +353,7 @@ void Type3(Reader& in, uint32_t packet) {
       if (opcode == kPm4ImLoad) {
         uint32_t pa = first & 0x1FFFFFFC;
         if (pa + 4 * uint64_t(words) > kPhysicalSize) Fatal(nullptr, "GPU: a shader at %x outside physical memory", pa);
-        LandResolves();
+        LandResolves(pa, pa + 4 * words);
         for (uint32_t k = 0; k < words; k++) code[k] = Rd32(PhysicalToVirtual(pa + 4 * k));
         in.Skip(count - 2);
       } else {
@@ -383,6 +386,7 @@ void Type3(Reader& in, uint32_t packet) {
       uint32_t addr = in.Next() & 0x3FFFFFFF, offset_type = in.Next(), words = in.Next() & 0xFFF;
       uint32_t type = offset_type >> 16 & 0xFF;
       if (type > 4) Fatal(nullptr, "GPU: LOAD_ALU_CONSTANT of type %u", type);
+      LandResolves(addr & 0x1FFFFFFF, (addr & 0x1FFFFFFF) + 4 * words);
       for (uint32_t k = 0; k < words; k++)
         WriteRegister(kBase[type] + (offset_type & 0x7FF) + k, Rd32(PhysicalToVirtual(addr + 4 * k)));
       return;

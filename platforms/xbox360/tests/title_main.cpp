@@ -8,7 +8,10 @@
 // rumbling it: low-frequency speed 0x1111 unplugs the second pad, 0x2222
 // plugs it in again, 0x3333 presses B on the first and pulls its left
 // trigger (SDL holds a trigger's value from before the pad is opened
-// back, so it is not set before).
+// back, so it is not set before). A speed with bit 15 set marks a point
+// of its GPU checks: from the last mark (0x8000 only sets one), resolves
+// landed n times in all (bits 10-14), n by draws' and packets' reads of
+// memory a resolve wrote (5-9) and draws loaded n host targets (0-4).
 
 #include <SDL3/SDL.h>
 
@@ -18,7 +21,9 @@
 #include <mutex>
 #include <thread>
 
+#include "xbox360/edram.h"
 #include "xbox360/process.h"
+#include "xbox360/render.h"
 
 namespace {
 
@@ -29,10 +34,30 @@ std::condition_variable g_cv;
 std::deque<uint16_t> g_requests;
 uint16_t g_last = 0;
 
-// Called by SDL inside the title's XamInputSetState: the request is
-// carried out on the harness's own thread.
+// The GPU counters at the last mark.
+uint64_t g_landings, g_overlap_landings, g_loads;
+
+void Mark(uint16_t m) {
+  using namespace recomp::xbox360;
+  uint64_t a = ResolveLandings() - g_landings, b = ResolveOverlapLandings() - g_overlap_landings,
+           c = TargetLoads() - g_loads;
+  if (m != 0x8000 && (a != (m >> 10 & 31u) || b != (m >> 5 & 31u) || c != (m & 31u)))
+    std::fprintf(stderr, "FAIL: GPU mark %04x: %llu landings, %llu by reads, %llu target loads\n", m,
+                 (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
+  g_landings += a;
+  g_overlap_landings += b;
+  g_loads += c;
+}
+
+// Called by SDL inside the title's XamInputSetState: a mark is checked at
+// once, other requests are carried out on the harness's own thread.
 bool Rumble(void*, uint16_t low, uint16_t) {
   std::lock_guard<std::mutex> g(g_lock);
+  if (low & 0x8000) {
+    if (low != g_last) Mark(low);
+    g_last = low;
+    return true;
+  }
   if (low != g_last && low) g_requests.push_back(low);
   g_last = low;
   g_cv.notify_one();

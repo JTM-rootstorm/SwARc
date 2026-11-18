@@ -21,8 +21,17 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
 // What the host targets hold that the EDRAM does not yet, into the EDRAM:
 // before anything else reads it (a resolve).
 void StoreTargets();
-// The EDRAM was written (a resolve's clears): the host targets take what
-// it holds before the next draw into them.
-void InvalidateTargets();
+// A resolve's clear of pixels [x0, x1) x [y0, y1) of the colour (depth:
+// depth) target at base tile `base` of a surface `width` pixels and
+// `pitch` tiles wide with MSAA mode `msaa`, of format `format`, to the
+// EDRAM words `lo` and (64bpp) `hi`, from the command processor with the
+// display device's lock held: a host target of that surface whose rows
+// in use and width it covers takes the clear itself; others whose tiles
+// it touches load again before the next draw into them.
+void ClearTargets(bool depth, uint32_t base, uint32_t width, uint32_t pitch, uint32_t msaa, uint32_t format,
+                  int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t lo, uint32_t hi);
+// How many times draws loaded a host target from the EDRAM, for the test
+// harness.
+uint64_t TargetLoads();
 
 }  // namespace recomp::xbox360

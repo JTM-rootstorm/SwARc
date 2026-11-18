@@ -5,9 +5,8 @@
 // caches and texture load shaders); docs/xenos.md, "Textures", says what
 // is taken from where and what is a choice.
 //
-// PackedMipOffset, Tiled3D and the 20e4 and 24-bit unorm conversions are
-// ported from Xenia's (texture_util.cc's GetPackedMipOffset,
-// texture_address.h, xenos.h):
+// PackedMipOffset and Tiled3D are ported from Xenia's (texture_util.cc's
+// GetPackedMipOffset, texture_address.h):
 // Copyright (c) 2015, Ben Vanik. All rights reserved. BSD 3-Clause; the
 // licence is in NOTICE.
 
@@ -135,17 +134,6 @@ float Component(uint32_t v, uint32_t bits, uint32_t sign) {
   return float(v) / float(bits == 32 ? 4294967295.0 : double((1ull << bits) - 1));
 }
 
-float Half(uint16_t h) {
-  uint32_t e = h >> 10 & 0x1F, m = h & 0x3FF, s = uint32_t(h >> 15) << 31, bits;
-  if (e == 0) {
-    float f = std::ldexp(float(m), -24);
-    return h >> 15 ? -f : f;
-  }
-  bits = e == 31 ? s | 0x7F800000 | m << 13 : s | (e + 112) << 23 | m << 13;
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
 // Exact for values a half holds (the half formats' own), rounded to the
 // nearest even otherwise.
 uint16_t ToHalf(float f) {
@@ -165,22 +153,6 @@ uint16_t ToHalf(float f) {
   uint32_t half = uint32_t(he) << 10 | m >> 13, rest = m & 0x1FFF;
   if (rest > 0x1000 || (rest == 0x1000 && (half & 1))) half++;
   return uint16_t(s | half);
-}
-
-float Unorm24(uint32_t d) { return float(d + (d >> 23)) * (1.0f / 16777216.0f); }
-float F20e4(uint32_t f) {
-  f &= 0xFFFFFF;
-  if (!f) return 0;
-  uint32_t m = f & 0xFFFFF, e = f >> 20;
-  if (!e) {
-    uint32_t lz = 20 - Log2Floor(m);
-    e = 1 - lz;
-    m = (m << lz) & 0xFFFFF;
-  }
-  uint32_t bits = (e + 112) << 23 | m << 3;
-  float r;
-  std::memcpy(&r, &bits, 4);
-  return r;
 }
 
 // DXT colour endpoints, 5:6:5 (red high) to 8:8:8 with the low bits
@@ -537,11 +509,32 @@ uint32_t BlockAddress(const Layout& l, const Storage& st, uint32_t x, uint32_t y
 }
 
 // ---- the cache ---------------------------------------------------------------
+// A texture's image and what it holds (a choice: no write tracking):
+// - stale: it must be decoded from memory before it is sampled (new, or
+//   a resolve wrote its memory and it did not take the texels itself);
+// - decoded, hash known: it holds what memory held when hashed;
+// - updated by resolves still on the device, hash unknown: it holds what
+//   memory will hold when they land.
+// Events: a resolve into its memory updates it on the device where it
+// matches (TexturesResolved; hash unknown) unless it is stale, else
+// makes it stale. The resolves landing hash the memory of those updated
+// (TexturesLanded; hash known). Its first use in a frame (a swap) with
+// the hash known compares it with its memory's, unless a resolve still
+// on the device wrote there: a difference makes it stale. A stale
+// texture lands what it reads, decodes and hashes. So a CPU write is
+// seen at the texture's first use in a later frame, except one between
+// an update by a resolve and the resolve landing outside the bytes the
+// resolve writes back (inside them, memory itself loses it).
 struct Texture {
   gfx::TextureId image = 0;
   std::vector<std::pair<uint32_t, uint32_t>> ranges;  // guest physical [lo, hi)
   uint64_t hash = 0, hashed_frame = UINT64_MAX, used_frame = 0;
-  bool stale = true;
+  bool stale = true, hash_known = false;
+  // Whether resolves can update it in place (TexturesResolved): its level
+  // 0 at base, pitch texels a row, in format, with endian swap endian.
+  bool in_place = false;
+  uint32_t base = 0, pitch = 0, format = 0, endian = 0;
+  int32_t w = 0, h = 0;
 };
 std::map<std::array<uint32_t, 6>, std::unique_ptr<Texture>> g_textures;
 gfx::TextureId g_null[4];  // by gfx::TextureKind: (0, 0, 0, 0)
@@ -628,10 +621,21 @@ void Encode(HostClass c, const float v[4], uint8_t* out) {
 }
 
 // Formats whose texels, unsigned, are their host texels' bytes (the
-// missing components repeated): copied without converting.
+// missing components repeated): copied without converting; and
+// 2_10_10_10 to 16-bit unorm rounded to nearest in integers (resolves'
+// texture updates on the device, kUpdate in edram.cpp, give the same).
 bool CopyTexel(uint32_t f, const uint8_t* b, uint8_t* out) {
   uint32_t size;
   switch (f) {
+    case 7: case 54: {
+      uint32_t v;
+      std::memcpy(&v, b, 4);
+      uint16_t c[4];
+      for (uint32_t k = 0; k < 3; k++) c[k] = uint16_t(((v >> (10 * k) & 0x3FF) * 65535 + 511) / 1023);
+      c[3] = uint16_t((v >> 30) * 21845);
+      std::memcpy(out, c, 8);
+      return true;
+    }
     case 2: case 8: std::memset(out, b[0], 4); return true;
     case 6: case 14: case 50: std::memcpy(out, b, 4); return true;
     case 26: case 29: case 32: std::memcpy(out, b, 8); return true;
@@ -645,6 +649,34 @@ bool CopyTexel(uint32_t f, const uint8_t* b, uint8_t* out) {
   uint32_t bytes = f == 36 ? 16 : f == 37 || f == 24 || f == 27 || f == 30 ? 8 : 4;
   for (uint8_t* end = out + bytes; out < end; out += size) std::memcpy(out, b, size);
   return true;
+}
+
+// The guest physical ranges of a texture's levels in use.
+std::vector<std::pair<uint32_t, uint32_t>> Ranges(const Layout& l) {
+  std::vector<std::pair<uint32_t, uint32_t>> r;
+  uint32_t array = l.dimension == 2 ? 1 : l.layers;
+  for (uint32_t level = l.mip_min; level <= l.mip_max; level++) {
+    if (level == 0 ? !l.base : !l.mips) continue;
+    Storage st = LevelStorage(l, level);
+    if (uint64_t(st.address) + uint64_t(st.slice_bytes) * array > kPhysicalSize)
+      Fatal(nullptr, "GPU: a %s texture at %x, outside physical memory", kFormats[l.format].name, st.address);
+    r.push_back({st.address, st.address + st.slice_bytes * array});
+  }
+  return r;
+}
+
+// The texture formats whose texels are a resolve's copy's words as they
+// are, by the copy's texture format.
+bool TakesCopy(uint32_t copy, uint32_t format) {
+  switch (copy) {
+    case 6: case 14: case 50: return format == 6 || format == 14 || format == 50;
+    case 7: case 54: return format == 7 || format == 54;
+    case 22: return format == 22 || format == 23;
+    case 31: return format == 28 || format == 31;
+    case 32: return format == 29 || format == 32;
+    case 25: case 26: case 36: case 37: return format == copy;
+    default: return false;
+  }
 }
 
 // Decodes a fetch constant's texture into a new host image.
@@ -674,9 +706,22 @@ void Decode(Texture& t, const Fetch& f) {
            : f.stacked()      ? gfx::TextureKind::Tex2DArray
                               : gfx::TextureKind::Tex2D;
   d.layers = int(l.dimension == 2 ? l.depth : l.layers);
+  // A 2D tiled texture of one level in a format resolves write (signs
+  // only for the float formats, which ignore them), which resolves can
+  // update in place: a colour target image too.
+  uint32_t written = l.format == 23 ? 22 : l.format == 28 ? 31 : l.format == 29 ? 32 : l.format;
+  t.in_place = d.kind == gfx::TextureKind::Tex2D && l.dimension == 1 && l.tiled && l.base && !l.mip_max &&
+               l.packed_level && (!any_signed || FloatFormat(l.format)) && TakesCopy(written, l.format);
+  d.color_target = t.in_place;
+  t.base = l.base;
+  t.pitch = l.pitch_texels;
+  t.format = l.format;
+  t.endian = f.endian();
+  t.w = d.w;
+  t.h = d.h;
   t.image = dev.CreateImage(d);
   if (!t.image) Fatal(nullptr, "GPU: no host image for a %ux%u %s texture", l.width, l.height, fm.name);
-  t.ranges.clear();
+  t.ranges = Ranges(l);
   uint32_t array = l.dimension == 2 ? 1 : l.layers, hb = HostBytes(hc);
   uint8_t probe[16] = {}, sink[16];
   bool copy = !any_signed && CopyTexel(l.format, probe, sink);
@@ -688,9 +733,6 @@ void Decode(Texture& t, const Fetch& f) {
     uint32_t w = std::max(l.width >> level, 1u), h = std::max(l.height >> level, 1u);
     uint32_t depth = l.dimension == 2 ? std::max(l.depth >> level, 1u) : 1;
     uint32_t bw = (w + fm.bw - 1) / fm.bw, bh = (h + fm.bh - 1) / fm.bh;
-    t.ranges.push_back({st.address, st.address + st.slice_bytes * array});
-    if (uint64_t(st.address) + uint64_t(st.slice_bytes) * array > kPhysicalSize)
-      Fatal(nullptr, "GPU: a %s texture at %x, outside physical memory", fm.name, st.address);
     std::vector<uint8_t> image(size_t(w) * h * hb);
     for (uint32_t slice = 0; slice < array; slice++) {
       for (uint32_t z = 0; z < depth; z++) {
@@ -749,6 +791,12 @@ void Sweep(uint64_t frame) {
   }
 }
 
+bool Pending(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  for (auto [lo, hi] : ranges)
+    if (ResolvePending(lo, hi)) return true;
+  return false;
+}
+
 gfx::TextureId Null(gfx::TextureKind kind) {
   gfx::TextureId& id = g_null[uint32_t(kind)];
   if (id) return id;
@@ -790,15 +838,16 @@ TextureBinding BindTexture(const ShaderTexture& st) {
   }
   std::unique_ptr<Texture>& t = g_textures[Key(f)];
   if (!t) t = std::make_unique<Texture>();
-  // Guest memory is checked once a frame (a choice: no write tracking; a
-  // resolve's writes mark textures stale at once).
-  if (!t->stale && t->hashed_frame != frame) {
+  // Its memory checked at its first use in a frame (Texture says how).
+  if (!t->stale && t->hash_known && t->hashed_frame != frame) {
     t->hashed_frame = frame;
-    t->stale = Hash(t->ranges) != t->hash;
+    if (!Pending(t->ranges)) t->stale = Hash(t->ranges) != t->hash;
   }
   if (t->stale) {
+    for (auto [lo, hi] : Ranges(l)) LandResolvesLocked(lo, hi);
     Decode(*t, f);
     t->hash = Hash(t->ranges);
+    t->hash_known = true;
     t->hashed_frame = frame;
     t->stale = false;
   }
@@ -842,10 +891,36 @@ TextureBinding BindTexture(const ShaderTexture& st) {
   return b;
 }
 
-void InvalidateTextures(uint32_t lo, uint32_t hi) {
+void TexturesLanded() {
   for (auto& [key, t] : g_textures)
-    for (auto [a, b] : t->ranges)
-      if (a < hi && lo < b) t->stale = true;
+    if (!t->stale && !t->hash_known) {
+      t->hash = Hash(t->ranges);
+      t->hash_known = true;
+    }
+}
+
+std::vector<TextureUpdate> TexturesResolved(uint32_t lo, uint32_t hi, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                                            uint32_t base, uint32_t pitch, uint32_t format, uint32_t endian) {
+  std::vector<TextureUpdate> updates;
+  for (auto& [key, t] : g_textures) {
+    bool touched = false;
+    for (auto [a, b] : t->ranges) touched |= a < hi && lo < b;
+    if (!touched) continue;
+    // The copy's base is the texture's, or that of one of its 32x32
+    // blocks (the copy then writes the texture's texels that far right and
+    // down, its rectangle within the rows).
+    uint32_t block = 1024 * kFormats[t->format].bytes, delta = base - t->base, blocks = delta / block,
+             row = t->pitch / 32;
+    int32_t dx = int32_t(32 * (blocks % row)), dy = int32_t(32 * (blocks / row));
+    if (!t->stale && t->in_place && base >= t->base && delta % block == 0 && t->pitch == pitch &&
+        t->endian == endian && TakesCopy(format, t->format) && x0 >= 0 && y0 >= 0 && x1 + dx <= int32_t(pitch)) {
+      updates.push_back({t->image, t->format, t->w, t->h, dx, dy});
+      t->hash_known = false;
+    } else {
+      t->stale = true;
+    }
+  }
+  return updates;
 }
 
 }  // namespace recomp::xbox360

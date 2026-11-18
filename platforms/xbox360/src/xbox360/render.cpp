@@ -13,6 +13,7 @@
 #include "xbox360/render.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -365,12 +366,14 @@ struct Target {
   bool wide;                           // 64bpp: two words a sample, tiles of 40x16
   gfx::TextureId image = 0;            // a colour target's
   gfx::DepthId ds = 0;                 // a depth target's, and the image its stencil is read
-  gfx::TextureId stencil = 0;          // into
+  gfx::TextureId stencil_image = 0;    // into
   int w = 0, h = 0;
   bool valid = false;  // holds what the EDRAM holds (in its rows in use)
   bool dirty = false;  // drawn into since its last store
   uint32_t rows = 0;   // in use: what draws' scissors reach
+  int stencil = -1;    // a depth target's stencil in all those rows, where known (a clear)
 };
+std::atomic<uint64_t> g_loads;  // read by the test harness
 
 // The host format of each colour target format: 8_8_8_8 as unorm (the
 // gamma one holding the gamma values, as Xenia does); 2_10_10_10 as unorm;
@@ -392,16 +395,37 @@ gfx::Format HostFormat(uint32_t format) {
 }
 bool Wide(uint32_t format) { return format == 5 || format == 7 || format == 15; }
 
+// What a load gives a colour target for its EDRAM words (Unpack and
+// HostScale), on the CPU.
+gfx::Color LoadedColor(uint32_t format, uint32_t v0, uint32_t v1) {
+  auto un = [](uint32_t v, uint32_t at, uint32_t bits) {
+    return float(v >> at & ((1u << bits) - 1)) / float((1u << bits) - 1);
+  };
+  auto fixed = [](uint32_t v) { return std::max(-32.0f, float(int16_t(v)) * (32.0f / 32767.0f)) * (1.0f / 32.0f); };
+  auto half = [](uint32_t v) { return Half(uint16_t(v)); };
+  auto bits = [](uint32_t v) {
+    float f;
+    std::memcpy(&f, &v, 4);
+    return f;
+  };
+  switch (format) {
+    case 0: case 1: return {un(v0, 0, 8), un(v0, 8, 8), un(v0, 16, 8), un(v0, 24, 8)};
+    case 2: case 10: return {un(v0, 0, 10), un(v0, 10, 10), un(v0, 20, 10), un(v0, 30, 2)};
+    case 3: case 12: return {F7e3(v0), F7e3(v0 >> 10), F7e3(v0 >> 20), un(v0, 30, 2)};
+    case 4: return {fixed(v0), fixed(v0 >> 16), 0, 0};
+    case 5: return {fixed(v0), fixed(v0 >> 16), fixed(v1), fixed(v1 >> 16)};
+    case 6: return {half(v0 & 0xFFFF), half(v0 >> 16), 0, 0};
+    case 7: return {half(v0 & 0xFFFF), half(v0 >> 16), half(v1 & 0xFFFF), half(v1 >> 16)};
+    case 14: return {bits(v0), 0, 0, 0};
+    default: return {bits(v0), bits(v1), 0, 0};  // 15
+  }
+}
 // What the host target holds of a value: a 32nd of the fixed-point
 // formats'.
 const char kHostScaleGlsl[] = R"(
 float HostScale(uint fmt) { return fmt == 4u || fmt == 5u ? 1.0 / 32.0 : 1.0; }
 )";
 
-// A full-target triangle (loads and stencil reads, scissored to rows).
-const char kFullVertex[] = R"(
-void main() { gl_Position = vec4(gl_VertexIndex == 1 ? 3.0 : -1.0, gl_VertexIndex == 2 ? 3.0 : -1.0, 0.0, 1.0); }
-)";
 // Loads draw the EDRAM's words into a target: a colour target's unpacked
 // (Unpack, as resolves read them); a depth target's depth (r.x < 0), or
 // one bit of its stencil (the samples whose bit r.x is set pass).
@@ -440,7 +464,7 @@ void main() { xe_out = vec4(float(1 << r.x) / 255.0); }
 const char kStoreUniforms[] = R"(
 layout(R_UNIFORMS) uniform U {
   uvec4 t;  // base, pitch, format, 64bpp
-  ivec4 r;  // width, first row, end row
+  ivec4 r;  // width, first row, end row, the stencil where known (else -1)
 };
 )";
 const char kStoreColor[] = R"(
@@ -462,7 +486,7 @@ void main() {
   ivec2 p = ivec2(gl_GlobalInvocationID.xy) + ivec2(0, r.y);
   if (p.x >= r.x || p.y >= r.z) return;
   float d = texelFetch(xe_depth, ivec3(p, 0), 0).r;
-  uint s = uint(texelFetch(xe_stencil, p, 0).r * 255.0 + 0.5);
+  uint s = r.w >= 0 ? uint(r.w) : uint(texelFetch(xe_stencil, p, 0).r * 255.0 + 0.5);
   uint d24 = t.z == 0u ? F32ToUnorm24(d) : F32To20e4(d);
   r_rw[r_rwbuf[0].x + EdramWord(p, 0u, t.x, t.y, uvec2(0u), false, true)] = d24 << 8 | s;
 }
@@ -524,6 +548,7 @@ gfx::ProgramDraw FullDraw(gfx::ProgramId prog, const Target& t, uint32_t first, 
 
 void Load(Target& t, uint32_t first, uint32_t end) {
   if (end <= first) return;
+  g_loads++;
   gfx::Device& dev = HostDevice();
   struct {
     uint32_t t[4];
@@ -533,7 +558,7 @@ void Load(Target& t, uint32_t first, uint32_t end) {
   std::string fs = std::string(kLoadUniforms) + kEdramGlsl + kHostScaleGlsl;
   if (!t.depth) {
     gfx::ProgramDraw d =
-        FullDraw(Make(g_state.load_color, kFullVertex, fs + kLoadColor, 1, 32), t, first, end);
+        FullDraw(Make(g_state.load_color, kFullTargetVertex, fs + kLoadColor, 1, 32), t, first, end);
     d.targets[0] = {t.image, 0};
     d.fs.buffers = &edram;
     d.fs.uniforms = &u;
@@ -541,7 +566,8 @@ void Load(Target& t, uint32_t first, uint32_t end) {
     return;
   }
   // The depth, and the stencil cleared; then each stencil bit set.
-  gfx::ProgramDraw d = FullDraw(Make(g_state.load_depth, kFullVertex, fs + kLoadDepth, 1, 32), t, first, end);
+  t.stencil = -1;
+  gfx::ProgramDraw d = FullDraw(Make(g_state.load_depth, kFullTargetVertex, fs + kLoadDepth, 1, 32), t, first, end);
   d.depth = t.ds;
   d.fs.buffers = &edram;
   d.fs.uniforms = &u;
@@ -566,15 +592,15 @@ void Store(Target& t) {
   struct {
     uint32_t t[4];
     int32_t r[4];
-  } u = {{t.base, t.pitch, t.format, t.wide ? 1u : 0u}, {t.w, 0, int32_t(t.rows), 0}};
+  } u = {{t.base, t.pitch, t.format, t.wide ? 1u : 0u}, {t.w, 0, int32_t(t.rows), t.stencil}};
   std::string cs = std::string(kStoreUniforms) + kEdramGlsl + kHostScaleGlsl;
   gfx::ProgramDispatch d;
   gfx::TextureId textures[2] = {t.image, 0};
-  if (t.depth) {
-    // The stencil into its image first.
-    dev.ClearImage(t.stencil, 0, {0, 0, 0, 0});
-    gfx::ProgramDraw s = FullDraw(Make(g_state.stencil_bit, kFullVertex, kStencilBit, 0, 16), t, 0, t.rows);
-    s.targets[0] = {t.stencil, 0};
+  if (t.depth && t.stencil < 0) {
+    // The stencil into its image first, unless it is known.
+    dev.ClearImage(t.stencil_image, 0, {0, 0, 0, 0});
+    gfx::ProgramDraw s = FullDraw(Make(g_state.stencil_bit, kFullTargetVertex, kStencilBit, 0, 16), t, 0, t.rows);
+    s.targets[0] = {t.stencil_image, 0};
     s.depth = t.ds;
     s.state.stencil = true;
     s.state.stencil_front.compare = s.state.stencil_back.compare = gfx::CompareOp::Equal;
@@ -588,8 +614,10 @@ void Store(Target& t) {
       s.state.stencil_read_mask = uint8_t(1 << bit[0]);
       dev.DrawProgram(s);
     }
+  }
+  if (t.depth) {
     textures[0] = t.ds;
-    textures[1] = t.stencil;
+    textures[1] = t.stencil_image;
     d.program = MakeCompute(g_state.store_depth, cs + kStoreDepth, 2, true);
   } else {
     d.program = MakeCompute(g_state.store_color, cs + kStoreColor, 1, false);
@@ -626,8 +654,8 @@ Target& GetTarget(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint
     s.h = n->h;
     s.fmt = gfx::Format::R8;
     s.color_target = true;
-    n->stencil = dev.CreateImage(s);
-    if (!n->ds || !n->stencil) Fatal(nullptr, "GPU: no host image for a %dx%d depth target", n->w, n->h);
+    n->stencil_image = dev.CreateImage(s);
+    if (!n->ds || !n->stencil_image) Fatal(nullptr, "GPU: no host image for a %dx%d depth target", n->w, n->h);
   } else {
     gfx::ImageDesc d;
     d.w = n->w;
@@ -700,6 +728,7 @@ std::vector<uint32_t> RawIndices(uint32_t initiator, uint32_t count, uint32_t ba
     if (!wide && endian > 1) Fatal(nullptr, "GPU: 16-bit indices with endian swap %u", endian);
     if (pa >= kPhysicalSize || uint64_t(count) * bytes > kPhysicalSize - pa)
       Fatal(nullptr, "GPU: %u indices at %x, outside physical memory", count, base);
+    LandResolves(pa, pa + count * bytes);
   }
   std::vector<uint32_t> out(count);
   for (uint32_t i = 0; i < count; i++) {
@@ -1015,7 +1044,6 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
                (prim == kPrimLineStrip || prim == kPrimTriangleFan || prim == kPrimTriangleStrip ||
                 prim == kPrimLineLoop);
   if (reset && prim == kPrimLineLoop) Fatal(nullptr, "GPU: a line loop with a reset index (not implemented yet)");
-  LandResolves();
   std::vector<uint32_t> raw;
   if (indexed) raw = RawIndices(initiator, count, index_base, index_size, immediate, reset, reset_index);
   Kind kind = prim == kPrimRectangleList ? kKindRectangles : prim == kPrimPointList ? kKindPoints : kKindList;
@@ -1055,6 +1083,8 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
       end = std::clamp<int64_t>(int64_t(hi) * b.stride + b.extent, first, words);
     }
     vf.insert(vf.end(), {w1 & 3, uint32_t(first), uint32_t(end - first), 0});
+    // The words are copied as the draw is recorded.
+    LandResolves(pa + 4 * uint32_t(first), pa + 4 * uint32_t(end));
     // A buffer of no words still names one, which nothing reads.
     buffers.push_back(
         {Mem() + PhysicalToVirtual(pa + 4 * uint32_t(first)), std::max(4u, 4 * uint32_t(end - first)), 0, 0});
@@ -1261,6 +1291,12 @@ void Draw(uint32_t initiator, uint32_t index_base, uint32_t index_size, const ui
       Fatal(nullptr, "GPU: back faces with their own stencil reference or masks (not implemented yet)");
     d.state.stencil_ref = uint8_t(ref);
     d.state.stencil_read_mask = uint8_t(ref >> 8);
+    // A draw whose stencil test can write: its stencil no longer known.
+    auto writes = [](const gfx::StencilFace& f) {
+      return f.fail != gfx::StencilOp::Keep || f.pass != gfx::StencilOp::Keep || f.depth_fail != gfx::StencilOp::Keep;
+    };
+    if (stencil && ref >> 16 & 0xFF && (writes(d.state.stencil_front) || writes(d.state.stencil_back)))
+      bound.back()->stencil = -1;
     d.state.stencil_write_mask = uint8_t(ref >> 16);
     // Polygon offset (PA_SU_SC_MODE_CNTL bits 11-12), the front's unless
     // front faces are culled, as Xenia picks it: the offset in units of
@@ -1320,8 +1356,41 @@ void StoreTargets() {
   for (auto& t : g_state.targets) Store(*t);
 }
 
-void InvalidateTargets() {
-  for (auto& t : g_state.targets) t->valid = false;
+void ClearTargets(bool depth, uint32_t base, uint32_t width, uint32_t pitch, uint32_t msaa, uint32_t format,
+                  int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t lo, uint32_t hi) {
+  uint32_t shift_x = msaa == 2, shift_y = msaa >= 1;
+  // The tiles cleared: rows 0 to y1 of the surface (a superset).
+  Target cleared{};
+  cleared.base = base;
+  cleared.pitch = pitch;
+  cleared.wide = !depth && Wide(format);
+  uint32_t rows = uint32_t(y1) << shift_y;
+  for (auto& c : g_state.targets) {
+    Target& t = *c;
+    if (!Overlap(cleared, rows, t, t.rows)) continue;
+    // The target of the cleared surface, all of whose rows in use and the
+    // surface's width the rectangle covers, holds the cleared words as a
+    // load would give them (the columns of its last tile past the
+    // surface's width too, which nothing of the surface uses); the others
+    // there load again.
+    if (t.depth != depth || t.base != base || t.pitch != pitch || t.msaa != msaa || t.format != format || x0 ||
+        y0 || uint32_t(x1) < width || rows < t.rows) {
+      t.valid = false;
+      continue;
+    }
+    gfx::Device& dev = HostDevice();
+    if (depth) {
+      float z = format == kDepthD24S8 ? Unorm24(lo >> 8) : std::min(F20e4(lo >> 8), 1.0f);
+      dev.ClearDepth(t.ds, z, int(lo & 0xFF), 0);
+      t.stencil = int(lo & 0xFF);
+    } else {
+      dev.ClearImage(t.image, 0, LoadedColor(format, lo, hi));
+    }
+    t.valid = true;
+    t.dirty = false;
+  }
 }
+
+uint64_t TargetLoads() { return g_loads; }
 
 }  // namespace recomp::xbox360

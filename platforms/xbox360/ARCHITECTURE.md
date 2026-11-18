@@ -289,14 +289,19 @@ and titles see of the Xenos, and its draws (docs/xenos.md):
   EDRAM buffer before the draws into it that need them (a draw that
   writes the depth, stencil a bit at a time), and stores into it before
   a resolve or before an overlapping target is drawn into (compute,
-  stencil read back through stencil tests); a resolve's clears make
-  every target load again. Draws outside what is implemented
-  (docs/xenos.md, "Drawing") are fatal.
+  stencil read back through stencil tests); a resolve's clear clears
+  the host target it covers and makes the others there load again.
+  Draws outside what is implemented (docs/xenos.md, "Drawing") are
+  fatal.
 - Textures (`texture.{h,cpp}`) are decoded on the CPU from guest memory
-  into host images, kept by fetch constant; a resolve into one, or a
-  change of its memory seen by a hash once a frame, decodes it again,
-  and those not sampled for a while are dropped (docs/xenos.md,
-  "Textures").
+  into host images, kept by fetch constant; a resolve into one updates
+  it on the device where its layout and format take the copy's texels
+  as they are, else decodes it again, as a change of its memory seen by
+  a hash once a frame does; those not sampled for a while are dropped
+  (docs/xenos.md, "Textures").
+- A resolve's results reach guest memory later: before the guest can
+  see the GPU's progress, and before the GPU reads memory one wrote on
+  the CPU (`edram.h`, LandResolves).
 
 ### Audio
 The audio render driver (`src/xbox360/audio.{h,cpp}`, docs/xboxkrnl.md

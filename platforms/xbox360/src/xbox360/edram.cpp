@@ -11,6 +11,7 @@
 #include "xbox360/edram.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -84,15 +85,16 @@ void main() {
 // Copy: one sample of each pixel to the destination's tiled texel at the
 // same coordinates, as its words (raw) or converted from the target's
 // format to the texture's (unpacked, scaled by 2^exp_bias, red and blue
-// swapped, packed).
-const char kCopy[] = R"(
+// swapped, packed). CopyWords is a texel's words before the endian swap,
+// which the copy writes and textures updated in place decode (kUpdate).
+const char kCopyGlsl[] = R"(
 layout(R_UNIFORMS) uniform U {
   ivec4 rect;   // x0, y0, w, h
   uvec4 src;    // base, pitch, sample (4-6: samples 0-1, 2-3, 0-3 averaged), flags
                 // (1: 64bpp, 2: depth, 4: 64bpp texels, 8: convert)
   uvec4 shift;  // sample shifts x, y; red/blue swap kind (raw) or 1 (convert); endian
-  ivec4 dst;    // pitch (aligned to 32), bpb log2, base - range start
-  uvec4 conv;   // target format, texture format, scale (float bits)
+  ivec4 dst;    // pitch (aligned to 32), bpb log2, base - range start; a texture updated: dx, dy
+  uvec4 conv;   // target format, texture format, scale (float bits); a texture updated: its format
 };
 uint Endian(uint v, uint e) {
   if (e == 1u || e == 2u) v = ((v & 0x00FF00FFu) << 8) | ((v & 0xFF00FF00u) >> 8);
@@ -121,11 +123,8 @@ uvec2 Pack(uint fmt, vec4 c) {
     default: return uvec2(floatBitsToUint(c.r), floatBitsToUint(c.g));  // 37
   }
 }
-void main() {
-  ivec2 i = ivec2(gl_GlobalInvocationID.xy);
-  if (i.x >= rect.z || i.y >= rect.w) return;
-  ivec2 p = rect.xy + i;
-  bool wide = (src.w & 1u) != 0u, depth = (src.w & 2u) != 0u, wide_out = (src.w & 4u) != 0u;
+uvec2 CopyWords(ivec2 p) {
+  bool wide = (src.w & 1u) != 0u, depth = (src.w & 2u) != 0u;
   uint first = src.z < 4u ? src.z : src.z == 5u ? 2u : 0u, n = src.z < 4u ? 1u : src.z == 6u ? 4u : 2u;
   uint w = EdramWord(p, first, src.x, src.y, shift.xy, wide, depth);
   uint v0 = r_ld(0u, w), v1 = wide ? r_ld(0u, w + 1u) : 0u;
@@ -149,7 +148,17 @@ void main() {
     v0 = (v0 & 0xFFFF0000u) | (v1 & 0xFFFFu);
     v1 = (v1 & 0xFFFF0000u) | t;
   }
-  uint e = shift.w;
+  return uvec2(v0, v1);
+}
+)";
+const char kCopy[] = R"(
+void main() {
+  ivec2 i = ivec2(gl_GlobalInvocationID.xy);
+  if (i.x >= rect.z || i.y >= rect.w) return;
+  ivec2 p = rect.xy + i;
+  bool wide_out = (src.w & 4u) != 0u;
+  uvec2 v = CopyWords(p);
+  uint v0 = v.x, v1 = v.y, e = shift.w;
   if (e == 4u) {  // 8 in 64: the words trade places, then 8 in 32
     uint t = v0;
     v0 = v1;
@@ -162,11 +171,51 @@ void main() {
 }
 )";
 
+// A texture the copy writes into, updated in place (texture.h,
+// TexturesResolved): each texel as decoding the copy's words in the
+// texture's format (conv.w) gives it on the CPU, in the texture's host
+// class (texture.cpp's DecodeBlock, CopyTexel and Encode: 8-bit
+// components as they are, 10- and 2-bit ones to 16-bit unorm rounded to
+// nearest, 16-bit and float ones as they are, the missing components
+// repeating the last).
+const char kUpdate[] = R"(
+layout(location = 0) out vec4 xe_out;
+void main() {
+  uvec2 v = CopyWords(ivec2(gl_FragCoord.xy) - dst.zw);
+  uint f = conv.w;
+  vec4 o;
+  if (f == 6u || f == 14u || f == 50u) {
+    o = vec4(uvec4(v.x, v.x >> 8, v.x >> 16, v.x >> 24) & 0xFFu) / 255.0;
+  } else if (f == 7u || f == 54u) {
+    uvec3 c = (uvec3(v.x, v.x >> 10, v.x >> 20) & 0x3FFu) * 65535u + 511u;
+    o = vec4(vec3(c / 1023u), float((v.x >> 30) * 21845u)) / 65535.0;
+  } else if (f == 25u) {
+    o = vec4(uvec4(v.x, v.x >> 16, v.x >> 16, v.x >> 16) & 0xFFFFu) / 65535.0;
+  } else if (f == 26u) {
+    o = vec4(uvec4(v.x, v.x >> 16, v.y, v.y >> 16) & 0xFFFFu) / 65535.0;
+  } else if (f == 28u || f == 31u) {
+    vec2 h = unpackHalf2x16(v.x);
+    o = h.xyyy;
+  } else if (f == 29u || f == 32u) {
+    o = vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+  } else if (f == 36u) {
+    o = vec4(uintBitsToFloat(v.x));
+  } else if (f == 37u) {
+    o = vec2(uintBitsToFloat(v.x), uintBitsToFloat(v.y)).xyyy;
+  } else if (f == 22u) {
+    o = vec4(Unorm24(v.x >> 8));
+  } else {  // 23
+    o = vec4(F20e4(v.x >> 8));
+  }
+  xe_out = o;
+}
+)";
+
 // The EDRAM and the resolves' programs on the display's device
 // (HostDevice(), its lock held).
 struct State {
   gfx::BufferId edram = 0;
-  gfx::ProgramId clear = 0, copy = 0;
+  gfx::ProgramId clear = 0, copy = 0, update = 0;
 };
 State* g_state;
 
@@ -176,6 +225,7 @@ struct Range {
   uint32_t lo, hi;
 };
 std::vector<Range> g_pending;
+std::atomic<uint64_t> g_landings, g_overlap_landings;  // read by the test harness
 // More would only hold transfer memory: no resolve waits until then.
 constexpr size_t kMaxPending = 32;
 
@@ -192,10 +242,16 @@ State& Device() {
   d.cs.uniform_bytes = 64;
   d.local_size[0] = d.local_size[1] = 8;
   s->clear = dev.CreateProgram(d);
-  d.cs.glsl = std::string(kEdramGlsl) + kCopy;
+  d.cs.glsl = std::string(kEdramGlsl) + kCopyGlsl + kCopy;
   d.cs.buffers = 1;
   d.cs.uniform_bytes = 80;
   s->copy = dev.CreateProgram(d);
+  gfx::ProgramDesc u;
+  u.vs.glsl = kFullTargetVertex;
+  u.fs.glsl = std::string(kEdramGlsl) + kCopyGlsl + kUpdate;
+  u.fs.buffers = 1;
+  u.fs.uniform_bytes = 80;
+  s->update = dev.CreateProgram(u);
   g_state = s.release();
   return *g_state;
 }
@@ -412,19 +468,91 @@ uint F32To20e4(float f) {
 }
 )";
 
+const char kFullTargetVertex[] = R"(
+void main() { gl_Position = vec4(gl_VertexIndex == 1 ? 3.0 : -1.0, gl_VertexIndex == 2 ? 3.0 : -1.0, 0.0, 1.0); }
+)";
+
 gfx::BufferId EdramBuffer() { return Device().edram; }
 
+namespace {
+// With the display device's lock held.
+void LandHeld() {
+  if (g_pending.empty()) return;
+  HostDevice().LandWrites(true);
+  g_pending.clear();
+  g_landings++;
+  TexturesLanded();
+}
+}  // namespace
 void LandResolves() {
   if (g_pending.empty()) return;
   std::lock_guard<std::mutex> l(HostDeviceLock());
-  HostDevice().LandWrites(true);
-  g_pending.clear();
+  LandHeld();
 }
+bool ResolvePending(uint32_t lo, uint32_t hi) {
+  for (const Range& p : g_pending)
+    if (p.lo < hi && lo < p.hi) return true;
+  return false;
+}
+void LandResolves(uint32_t lo, uint32_t hi) {
+  if (!ResolvePending(lo, hi)) return;
+  g_overlap_landings++;
+  LandResolves();
+}
+void LandResolvesLocked(uint32_t lo, uint32_t hi) {
+  if (!ResolvePending(lo, hi)) return;
+  g_overlap_landings++;
+  LandHeld();
+}
+uint64_t ResolveLandings() { return g_landings; }
+uint64_t ResolveOverlapLandings() { return g_overlap_landings; }
 
 void StartEdram() {
   std::lock_guard<std::mutex> l(HostDeviceLock());
   Device();
 }
+
+float Half(uint16_t h) {
+  uint32_t e = h >> 10 & 0x1F, m = h & 0x3FF, s = uint32_t(h >> 15) << 31, bits;
+  if (e == 0) {
+    float f = std::ldexp(float(m), -24);
+    return h >> 15 ? -f : f;
+  }
+  bits = e == 31 ? s | 0x7F800000 | m << 13 : s | (e + 112) << 23 | m << 13;
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+float F7e3(uint32_t f) {
+  f &= 0x3FF;
+  if (!f) return 0;
+  uint32_t m = f & 0x7F, e = f >> 7;
+  if (!e) {
+    uint32_t lz = 7 - (31 - uint32_t(__builtin_clz(m)));
+    e = 1 - lz;
+    m = (m << lz) & 0x7F;
+  }
+  uint32_t bits = (e + 124) << 23 | m << 16;
+  float r;
+  std::memcpy(&r, &bits, 4);
+  return r;
+}
+float Unorm24(uint32_t d) { return float(d + (d >> 23)) * (1.0f / 16777216.0f); }
+float F20e4(uint32_t f) {
+  f &= 0xFFFFFF;
+  if (!f) return 0;
+  uint32_t m = f & 0xFFFFF, e = f >> 20;
+  if (!e) {
+    uint32_t lz = 20 - (31 - uint32_t(__builtin_clz(m)));
+    e = 1 - lz;
+    m = (m << lz) & 0xFFFFF;
+  }
+  uint32_t bits = (e + 112) << 23 | m << 3;
+  float r;
+  std::memcpy(&r, &bits, 4);
+  return r;
+}
+
 
 int32_t Tiled2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bpb_log2) {
   int32_t outer = ((y >> 5) * int32_t(pitch >> 5) + (x >> 5)) << 6;
@@ -496,8 +624,6 @@ void Resolve() {
   for (const Range& p : g_pending) overlaps |= p.lo < hi && lo < p.hi;
   if (overlaps) LandResolves();
   g_pending.push_back({lo, hi});
-  // Textures there decode again before they are next sampled.
-  InvalidateTextures(lo, hi);
   std::lock_guard<std::mutex> l(HostDeviceLock());
   State& s = Device();
   gfx::BufferData edram_in{nullptr, kEdramBytes, s.edram, 0};
@@ -519,6 +645,25 @@ void Resolve() {
           {color_format, format, scale_bits, 0}};
   gfx::RwBufferData dest{Mem() + PhysicalToVirtual(lo), hi - lo, 0, false};
   Dispatch(s, s.copy, r, &cu, &edram_in, &dest, true);
+  // Textures there that take the copy's texels as they are take them on
+  // the device, from the EDRAM before the clears; the others decode again
+  // before they are next sampled.
+  for (const TextureUpdate& t :
+       TexturesResolved(lo, hi, r.x0, r.y0, r.x1, r.y1, dest_base, dest_pitch, format, endian)) {
+    gfx::ProgramDraw d;
+    d.program = s.update;
+    d.targets[0] = {t.image, 0};
+    d.viewport = {0, 0, uint32_t(t.w), uint32_t(t.h), 0.0f, 1.0f};
+    d.scissor = {std::min(r.x0 + t.dx, t.w), std::min(r.y0 + t.dy, t.h), std::min(r.x1 + t.dx, t.w),
+                 std::min(r.y1 + t.dy, t.h)};
+    d.vertex_count = 3;
+    cu.conv[3] = t.format;
+    cu.dst[2] = t.dx;
+    cu.dst[3] = t.dy;
+    d.fs.buffers = &edram_in;
+    d.fs.uniforms = &cu;
+    HostDevice().DrawProgram(d);
+  }
 
   // Then the clears, of every sample in the rectangle.
   struct {
@@ -532,6 +677,8 @@ void Resolve() {
     clear.src[3] = 2;
     clear.value[0] = GpuRegister(kRegRbDepthClear);
     Dispatch(s, s.clear, r, &clear, nullptr, &edram_out);
+    ClearTargets(true, depth_info & 0xFFF, surface & 0x3FFF, pitch_tiles, msaa, depth_info >> 16 & 1, r.x0, r.y0,
+                 r.x1, r.y1, clear.value[0], 0);
   }
   if (clear_color && !depth) {
     // A 64bpp target takes RB_COLOR_CLEAR as its low word (Xenia's
@@ -543,8 +690,9 @@ void Resolve() {
     clear.value[0] = GpuRegister(kRegRbColorClear);
     clear.value[1] = GpuRegister(kRegRbColorClearLo);
     Dispatch(s, s.clear, r, &clear, nullptr, &edram_out);
+    ClearTargets(false, color_info & 0xFFF, surface & 0x3FFF, pitch_tiles, msaa, color_format, r.x0, r.y0, r.x1,
+                 r.y1, clear.value[0], clear.value[1]);
   }
-  if (clear_color || clear_depth) InvalidateTargets();
 }
 
 }  // namespace recomp::xbox360

@@ -2026,6 +2026,384 @@ static void Textures(void) {
 #undef PX
 }
 
+// A mark of the GPU checks for the test program (title_main.cpp): since
+// the last mark, resolves landed `landings` times, `reads` of them for
+// the GPU's reads of memory a resolve wrote, and draws loaded `loads`
+// host targets; Mark(-1, ...) only sets one. From an idle GPU (after
+// Kick).
+static void Mark(int landings, u32 reads, u32 loads) {
+  uint16_t vibration[2] = {
+      (uint16_t)(landings < 0 ? 0x8000 : 0x8000 | (u32)landings << 10 | reads << 5 | loads), 0};
+  XamInputSetState(0, 0, vibration);
+  vibration[0] = 0;
+  XamInputSetState(0, 0, vibration);
+}
+
+// Resolves into textures the cache holds, sampled before and after: those
+// whose level 0 is the copy's destination, in a format that decodes its
+// words as they are, take its texels on the device; others decode the
+// memory again once it has landed. Draws land resolves only where they
+// read what one wrote. Resolve clears that cover a target keep it from
+// loading again, with its stencil known.
+static void InPlace(void) {
+  u32 mem = MmAllocatePhysicalMemoryEx(0, 0x100000, kPageReadWrite, 0, 0, 0x1000), pmem = MmGetPhysicalAddress(mem);
+  for (u32 k = 0; k < 0x100000; k += 4) *At(mem + k) = 0;
+  gq.used = 0;
+  // Each clearing resolve copies to a 16 KiB area of its own (an overlap
+  // with another still on the device would land it).
+  u32 out = pmem, out_f = pmem + 0x4000, slot = pmem + 0x80000;
+#define SCRATCH (slot += 0x4000)
+  u32 n_pixel = 0, n_float = 0;
+#define NEXT (n_pixel++)
+#define PX(k) ((k) % 64), ((k) / 64)
+#define FNEXT (n_float++)
+#define FX(k) ((k) % 16), ((k) / 16)
+  // The output targets: 8_8_8_8 at 0x200 (cleared, all of it: kept), and
+  // 32_32_FLOAT at 0x210.
+  Set(0x2000, 64);
+  Set(0x2001, 0x200);
+  Set(0x231E, 0);
+  Set(0x231F, 0);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2001, 0x210 | 15 << 16);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+
+  // Two resolves of 8_8_8_8 target 0x300 into a 64x64 texture, the 16x16
+  // corner in A, then all of it in B: sampled in place, nothing lands but
+  // the fence's and the second resolve's (over the first's range).
+  u32 t1 = pmem + 0x20000;
+  {
+    struct Tex t = MakeTex(6, t1, 64, 64, 1, 1, 0, 1, 64, 2, 0, 2, XYZW);
+    TexConst(1, &t);
+  }
+  u32 p_two = NEXT;
+  NEXT, NEXT, NEXT, NEXT;
+  LoadPs(PsTex(1, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_two), 5.5f / 64, 5.5f / 64, 0);
+  Set(0x2001, 0x300);
+  Set(0x231E, 0xFF0000FF);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Resolve(0, t1, 6 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  Pixel(PX(p_two + 1), 5.5f / 64, 5.5f / 64, 0);
+  Pixel(PX(p_two + 2), 20.5f / 64, 20.5f / 64, 0);
+  Set(0x2001, 0x300);
+  Set(0x231E, 0xFF00FF00);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Resolve(0, t1, 6 << 7 | 2, 0);
+  Set(0x2001, 0x200);
+  Pixel(PX(p_two + 3), 20.5f / 64, 20.5f / 64, 0);
+  Pixel(PX(p_two + 4), 5.5f / 64, 5.5f / 64, 0);
+  Kick();
+  gq.used = 0;
+  Mark(2, 0, 0);
+
+  // 4x MSAA: pixel (0, 0) of 8_8_8_8 target 0x380 with samples 0 and 1 in
+  // (1, 0.5, 0.25, 1), 2 and 3 cleared to (0, 0, 0, 1); resolved averaged
+  // with exponent bias -1 (0x80102040; (1, 0) 0x80000000), and red and
+  // blue swapped too (0x80402010), into textures sampled before; then a
+  // coherency request (COHER_STATUS_HOST, which WAIT_REG_MEM sees done)
+  // and another resolve: the fence lands them all at once, the samples
+  // after the request are the resolves'.
+  u32 t2 = pmem + 0x24000, t3 = pmem + 0x28000;
+  {
+    struct Tex t = MakeTex(6, t2, 64, 64, 1, 1, 0, 1, 64, 2, 0, 2, XYZW);
+    TexConst(2, &t);
+    t.pa = t3;
+    TexConst(3, &t);
+  }
+  u32 p_avg = NEXT;
+  NEXT, NEXT, NEXT, NEXT;
+  LoadPs(PsTex(2, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg), 0.5f / 64, 0.5f / 64, 0);
+  LoadPs(PsTex(3, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg + 1), 0.5f / 64, 0.5f / 64, 0);
+  Set(0x2000, 64 | 2 << 16);
+  Set(0x2001, 0x380);
+  Set(0x231E, 0xFF000000);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  PixelShader(0);
+  const float c_avg[4] = {1, 0.5f, 0.25f, 1};
+  Rect(-0.5f, -0.5f, 0, 0.5f, 0, c_avg);
+  Resolve(6 << 4, t2, 63u << 16 | 6 << 7 | 2, 1);
+  Resolve(6 << 4, t3, 1u << 24 | 63u << 16 | 6 << 7 | 2, 1);
+  Set(0x0A31, 0x10);
+  Put(Type3(0x3C, 5));
+  Put(3);
+  Put(0x0A31);
+  Put(0);
+  Put(0xFFFFFFFF);
+  Put(0x100);
+  Resolve(0, SCRATCH, 6 << 7 | 2, 1);
+  Set(0x2000, 64);
+  Set(0x2001, 0x200);
+  LoadPs(PsTex(2, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg + 2), 0.5f / 64, 0.5f / 64, 0);
+  Pixel(PX(p_avg + 3), 1.5f / 64, 0.5f / 64, 0);
+  LoadPs(PsTex(3, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_avg + 4), 0.5f / 64, 0.5f / 64, 0);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 1);
+
+  // Each texture format a resolve writes, 16x16 at a 64-texel pitch, the
+  // endian swaps in turn: one level (in place) and, at the same address,
+  // with a second level (decoded again, after its first sample lands the
+  // resolves), from 16_16_16_16_FLOAT target 0x320 cleared to (0.25,
+  // 0.5, 0.75, 1) (the depth formats from depth target 0x340, depth
+  // 0.75 + 2^-24, stencil 0x55): both sampled into the 32_32_FLOAT target,
+  // X and Y then Z and W, alike. 16_16_16_16 into a texture of 8_8_8_8
+  // and 8_8_8_8 with another endian swap: refused, decoded again.
+  static const u32 kWrites[17][3] = {
+      // texture format, the resolve's, endian swap
+      {6, 6, 0},   {14, 14, 1}, {50, 50, 2}, {7, 7, 3},   {54, 54, 0}, {25, 25, 1}, {26, 26, 2}, {31, 31, 3},
+      {28, 31, 0}, {32, 32, 1}, {29, 32, 2}, {36, 36, 3}, {37, 37, 0}, {22, 22, 1}, {23, 22, 2}, {6, 26, 2},
+      {6, 6, 3},
+  };
+  u32 p_fmt = FNEXT, ps_fmt[4];
+  for (u32 c = 0; c < 4; c++) ps_fmt[c] = PsTex(4 + c, 1, TF_CONST, 0);
+  for (u32 k = 1; k < 17 * 4; k++) FNEXT;
+  Set(0x2001, 0x210 | 15 << 16);
+  for (int after = 0; after < 2; after++) {
+    if (after) {
+      Set(0x2001, 0x320 | 7 << 16);
+      Set(0x231E, 0x38003400);
+      Set(0x231F, 0x3C003A00);
+      Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+      Set(0x2002, 0x340);
+      Set(0x231D, 0xC0000055);
+      Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+      for (u32 k = 0; k < 17; k++) {
+        u32 at = t1 + 0x10000 + 0x2000 * k, e = k == 16 ? 2 : kWrites[k][2];
+        Resolve(kWrites[k][0] == 22 || kWrites[k][0] == 23 ? 4 : 0, at, kWrites[k][1] << 7 | e, 1);
+      }
+      Set(0x2001, 0x210 | 15 << 16);
+    }
+    for (u32 k = 0; k < 17; k++) {
+      u32 at = t1 + 0x10000 + 0x2000 * k;
+      struct Tex t = MakeTex(kWrites[k][0], at, 16, 16, 1, 1, 0, 1, 64, kWrites[k][2], 0, 2, XYZW);
+      TexConst(4, &t);
+      t.swizzle = 2 | 3 << 3 | 0 << 6 | 1 << 9;
+      TexConst(5, &t);
+      t.mip_max = 1;
+      t.mip_pa = pmem + 0xC0000 + 0x1000 * k;
+      t.swizzle = XYZW;
+      TexConst(6, &t);
+      t.swizzle = 2 | 3 << 3 | 0 << 6 | 1 << 9;
+      TexConst(7, &t);
+      for (u32 c = 0; c < 4; c++) {
+        LoadPs(ps_fmt[c], 15);
+        Pixel(FX(p_fmt + 4 * k + c), 5.5f / 16, 5.5f / 16, 0);
+      }
+    }
+  }
+  // A 64x64 8_8_8_8 at a 128-texel pitch, all of target 0x320 resolved
+  // there at a 64-texel pitch: refused, decoded again (texel (40, 40),
+  // past what the copy wrote, as before: 0), alike with a second level.
+  u32 tp = pmem + 0x70000, p_pitch = FNEXT;
+  FNEXT;
+  for (int after = 0; after < 2; after++) {
+    if (after) {
+      Set(0x2001, 0x320 | 7 << 16);
+      Resolve(0, tp, 6 << 7 | 2, 0);
+      Set(0x2001, 0x210 | 15 << 16);
+    }
+    struct Tex t = MakeTex(6, tp, 64, 64, 1, 1, 0, 1, 128, 2, 0, 2, XYZW);
+    TexConst(4, &t);
+    t.mip_max = 1;
+    t.mip_pa = pmem + 0xD8000;
+    TexConst(6, &t);
+    LoadPs(ps_fmt[0], 15);
+    Pixel(FX(p_pitch), 40.5f / 64, 40.5f / 64, 0);
+    LoadPs(ps_fmt[2], 15);
+    Pixel(FX(p_pitch + 1), 40.5f / 64, 40.5f / 64, 0);
+  }
+  // A 2_10_10_10 texel decoded on the CPU, red 820: 16-bit unorm 52530
+  // (820 / 1023 rounded to nearest; in floats it rounds up).
+  u32 t10 = pmem + 0x5C000;
+  *At(mem + 0x5C000) = GuestWord(820, 2);
+  {
+    struct Tex t = MakeTex(7, t10, 1, 1, 1, 1, 0, 0, 32, 2, 0, 2, XYZW);
+    TexConst(8, &t);
+  }
+  u32 p_10 = FNEXT;
+  LoadPs(PsTex(8, 1, TF_CONST, 0), 15);
+  Pixel(FX(p_10), 0.5f, 0.5f, 0);
+  Kick();
+  gq.used = 0;
+  Mark(2, 2, 1);
+  Resolve(0, out_f, 37 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 0);
+  volatile u32* tf = At(mem + 0x4000);
+#define TF(k, c) tf[TiledAt(FX(k), 64, 3) / 4 + (c)]
+  for (u32 k = 0; k < 17; k++)
+    for (u32 c = 0; c < 4; c++)
+      if (TF(p_fmt + 4 * k + c, 0) != TF(p_fmt + 4 * k + (c ^ 2), 0) ||
+          TF(p_fmt + 4 * k + c, 1) != TF(p_fmt + 4 * k + (c ^ 2), 1))
+        DbgPrint("FAIL line %d: format %u, %s: %08x %08x / %08x %08x\n", __LINE__, kWrites[k][0],
+                 c & 1 ? "Z W" : "X Y", TF(p_fmt + 4 * k + c, 0), TF(p_fmt + 4 * k + c, 1),
+                 TF(p_fmt + 4 * k + (c ^ 2), 0), TF(p_fmt + 4 * k + (c ^ 2), 1));
+  // The values: 8_8_8_8 (0.25 0.5 0.75 1 packed: 64 128 191 255),
+  // 16_16_16_16_FLOAT and 32_FLOAT as they are, k_24_8.
+  float f8;
+  u32 b8 = TF(p_fmt, 0);
+  memcpy(&f8, &b8, 4);
+  CHECK(f8 > 63.5f / 255 && f8 < 64.5f / 255 && TF(p_fmt + 1, 1) == FloatBits(1));
+  CHECK(TF(p_pitch, 0) == 0 && TF(p_pitch + 1, 0) == 0);
+  CHECK(TF(p_fmt + 4 * 9, 0) == FloatBits(0.25f) && TF(p_fmt + 4 * 9 + 1, 0) == FloatBits(0.75f));
+  CHECK(TF(p_fmt + 4 * 11, 0) == FloatBits(0.25f) && TF(p_fmt + 4 * 13, 0) == 0x3F400001);
+
+  // A texture updated in place, landed, then rewritten by the CPU: the
+  // next frame samples the CPU's texel.
+  *At(mem + 0x20000 + TiledAt(5, 5, 64, 2)) = 0xFF333333;
+  {
+    u32 fetch[6] = {1u << 31 | 2 << 22, (mem + 0xF0000) | 2 << 6 | 6, 63 | 63 << 13,
+                    (0 | 1 << 3 | 2 << 6 | 3 << 9) << 1, 0, 0},
+        front = mem + 0xF0000, format = 6, color_space = 0, width = 64, height = 64;
+    VdSwap10(&gq.rb[gq.w], fetch, 0, 0, 0, &front, &format, &color_space, &width, &height);
+    gq.w += 64;
+  }
+  u32 p_cpu = NEXT;
+  LoadPs(PsTex(1, 1, TF_CONST, 0), 15);
+  Pixel(PX(p_cpu), 5.5f / 64, 5.5f / 64, 0);
+
+  // A point whose vertex is a resolve's texels: 32_FLOAT target 0x360
+  // cleared to 8 and resolved (16x16) into the vertex buffer: x, y, z 8,
+  // colour (8, 8, 8, 8): pixel (8, 8) white. Its fetch lands the resolve.
+  u32 vb = pmem + 0xE0000;
+  Set(0x2001, 0x360 | 14 << 16);
+  Set(0x231E, FloatBits(8));
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Resolve(0, vb, 36 << 7 | 2, 1);
+  Set(0x2001, 0x200);
+  PixelShader(0);
+  Set(0x2280, 8 << 16 | 8);
+  DrawAuto(1, vb, 1);
+  Kick();
+  gq.used = 0;
+  Mark(1, 1, 0);
+
+  // Clears: target 0x3A0 drawn, then cleared in its corner (16x16), and
+  // drawn again: it loads; target 0x3C0 drawn, then all of 0x3A0 cleared
+  // (kept, no load) and both drawn again: neither loads.
+  u32 cl = pmem + 0x60000, cl2 = pmem + 0x64000;
+  Set(0x2001, 0x3A0);
+  Rect(0, 0, 64, 64, 0, kRed);
+  Set(0x2001, 0x3C0);
+  Rect(0, 0, 64, 64, 0, kGreen);
+  Kick();
+  gq.used = 0;
+  Mark(-1, 0, 0);
+  Set(0x2001, 0x3A0);
+  Set(0x231E, 0xFFFF0000);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 1);
+  Rect(40, 40, 48, 48, 0, kWhite);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 1);
+  Set(0x231E, 0xFF00FF00 | 0x80);
+  Resolve(0x100, SCRATCH, 6 << 7 | 2, 0);
+  Rect(40, 40, 48, 48, 0, kWhite);
+  Set(0x2001, 0x3C0);
+  Rect(0, 0, 8, 8, 0, kBlue);
+  Kick();
+  gq.used = 0;
+  Mark(1, 0, 0);
+  Set(0x2001, 0x3A0);
+  Resolve(0, cl, 6 << 7 | 2, 0);
+  Set(0x2001, 0x3C0);
+  Resolve(0, cl2, 6 << 7 | 2, 0);
+  Set(0x2001, 0x200);
+
+  // Depth target 0x3E0 (D24S8) with target 0x200 (no colour written):
+  // drawn (depth 0.75, always), cleared all (depth 1, stencil 0x5A: kept,
+  // known), drawn at depth 0.5 where less (8-24) without stencil, resolved
+  // (stencil known: 0x8000005A there, 0xFFFFFF5A around); then 0x33
+  // replaced at (32-40) where the stencil passes, resolved: per bit again.
+  u32 dd = pmem + 0x68000, dd2 = pmem + 0x6C000;
+  Set(0x2104, 0);
+  Set(0x2002, 0x3E0);
+  Set(0x2200, 2 | 4 | 7 << 4);
+  Rect(0, 0, 64, 64, 0.75f, kBlack);
+  Set(0x231D, 0xFFFFFF5A);
+  Resolve(0x200 | 4, SCRATCH, 6 << 7 | 2, 0);
+  Set(0x2200, 2 | 4 | 1 << 4);
+  Rect(8, 8, 24, 24, 0.5f, kBlack);
+  Set(0x2200, 0);
+  Resolve(4, dd, 6 << 7 | 2, 0);
+  Set(0x210D, 0xFFFF33);
+  Set(0x2200, 1 | 7 << 8 | 2 << 14);
+  Rect(32, 32, 40, 40, 0, kBlack);
+  Set(0x2200, 0);
+  Resolve(4, dd2, 6 << 7 | 2, 0);
+  Set(0x2002, 0x500);
+  Set(0x2104, 0xF);
+
+  Resolve(0, out, 6 << 7 | 2, 0);
+  Kick();
+  gq.used = 0;
+  volatile u32* t = At(mem);
+#define TX(k) t[TiledAt(PX(k), 64, 2) / 4]
+  CHECK(TX(p_two) == 0 && TX(p_two + 1) == 0xFF0000FF && TX(p_two + 2) == 0);
+  CHECK(TX(p_two + 3) == 0xFF00FF00 && TX(p_two + 4) == 0xFF00FF00);
+  CHECK(TX(p_avg) == 0 && TX(p_avg + 1) == 0);
+  CHECK(TX(p_avg + 2) == 0x80102040 && TX(p_avg + 3) == 0x80000000 && TX(p_avg + 4) == 0x80402010);
+  CHECK(*At(mem + 0x24000) == 0x80102040 && *At(mem + 0x28000) == 0x80402010);
+  CHECK(TX(p_cpu) == 0xFF333333);
+  CHECK(t[TiledAt(8, 8, 64, 2) / 4] == 0xFFFFFFFF);
+  float f10;
+  u32 b10 = TF(p_10, 0);
+  memcpy(&f10, &b10, 4);
+  CHECK(f10 > 52529.5f / 65535 && f10 < 52530.5f / 65535);
+  volatile u32* c1 = At(mem + 0x60000);
+  volatile u32* c2 = At(mem + 0x64000);
+  CHECK(c1[TiledAt(4, 4, 64, 2) / 4] == (0xFF00FF00 | 0x80) && c1[TiledAt(44, 44, 64, 2) / 4] == 0xFFFFFFFF);
+  CHECK(c2[TiledAt(4, 4, 64, 2) / 4] == 0xFFFF0000 && c2[TiledAt(20, 20, 64, 2) / 4] == 0xFF00FF00);
+  volatile u32* d1 = At(mem + 0x68000);
+  volatile u32* d2 = At(mem + 0x6C000);
+  CHECK(d1[TiledAt(16, 16, 64, 2) / 4] == 0x8000005A && d1[TiledAt(40, 4, 64, 2) / 4] == 0xFFFFFF5A);
+  CHECK(d2[TiledAt(36, 36, 64, 2) / 4] == 0xFFFFFF33 && d2[TiledAt(16, 16, 64, 2) / 4] == 0x8000005A);
+  // EVENT_WRITE_EXT after a resolve, then a wait (SCRATCH_REG1) that holds
+  // the GPU: the extents' words are written, and the resolve's texels are
+  // in memory before them (texel (1, 0) of target 0x200, 0xFF0000FF).
+  *At(mem + 0x57000) = 0xAAAAAAAA;
+  Set(0x0579, 0);
+  Resolve(0, pmem + 0x56000, 6 << 7 | 2, 1);
+  Put(Type3(0x5A, 2));
+  Put(0);
+  Put(pmem + 0x57000);
+  Put(Type3(0x3C, 5));
+  Put(3);
+  Put(0x579);
+  Put(1);
+  Put(0xFFFFFFFF);
+  Put(0x100);
+  gq.rb[gq.w++] = Type3(0x3F, 2);
+  gq.rb[gq.w++] = gq.pib;
+  gq.rb[gq.w++] = gq.n;
+  *Reg(0x1C5) = gq.w;
+  CHECK(WaitFor(At(mem + 0x57000), 0x400));
+  CHECK(*At(mem + 0x56000 + TiledAt(1, 0, 64, 2)) == 0xFF0000FF);
+  *Reg(0x579) = 1;
+  gq.n = 0;
+  Kick();
+  MmFreePhysicalMemory(0, mem);
+#undef TX
+#undef TF
+#undef NEXT
+#undef PX
+#undef FNEXT
+#undef FX
+#undef SCRATCH
+}
+
 // Draws into colour and depth targets, resolved and read back: a vertex
 // shader that fetches a position (x, y, z) and a colour and exports them,
 // pixel shaders that export the colour interpolated or float constants.
@@ -2371,6 +2749,7 @@ static void Draws(volatile u32* rb, u32 w, u32 data, u32 pdata) {
 #undef M
   Primitives();
   Textures();
+  InPlace();
 }
 
 // Waits up to a second for *p == v.

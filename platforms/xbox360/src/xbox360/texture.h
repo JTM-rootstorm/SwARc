@@ -5,6 +5,7 @@
 // the command processor's thread, the display device's lock held.
 
 #include <cstdint>
+#include <vector>
 
 #include "runtime/gfx/device.h"
 #include "xbox360/shader.h"
@@ -27,8 +28,23 @@ constexpr int32_t kTextureStackedLinear = 1;
 
 TextureBinding BindTexture(const ShaderTexture& t);
 
-// Guest physical memory [lo, hi) was written by the GPU (a resolve):
-// textures there decode again before they are next sampled.
-void InvalidateTextures(uint32_t lo, uint32_t hi);
+// A resolve's copy writes [lo, hi), texels [x0, x1) x [y0, y1) of a tiled
+// texture at physical `base`, `pitch` texels a row, in texture format
+// `format` with endian swap `endian` (the display device's lock held). The textures there whose
+// level 0 is that texture (or holds it from one of its 32x32 blocks on),
+// in a format that decodes the copy's words as they are, are returned to
+// take its texels on the device (in the image `image`, w x h, decoded as
+// `format`, the copy's texel (x, y) at (x + dx, y + dy)); the others
+// decode again before they are next sampled.
+struct TextureUpdate {
+  gfx::TextureId image;
+  uint32_t format;
+  int32_t w, h, dx, dy;
+};
+std::vector<TextureUpdate> TexturesResolved(uint32_t lo, uint32_t hi, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                                            uint32_t base, uint32_t pitch, uint32_t format, uint32_t endian);
+// The resolves landed (the display device's lock held): the memory of
+// textures they updated is hashed.
+void TexturesLanded();
 
 }  // namespace recomp::xbox360

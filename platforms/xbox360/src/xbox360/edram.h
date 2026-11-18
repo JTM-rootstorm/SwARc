@@ -28,12 +28,34 @@ void Resolve();
 // GPU's progress (memory it writes or reads, interrupts, the read
 // pointer, a swap): the results of the resolves before it, in memory.
 void LandResolves();
+// Before the GPU's own reads of memory on the CPU (packets, indices,
+// vertices, microcode, constants, textures): the resolves' results in
+// memory if one still on the device wrote into physical [lo, hi) (all of
+// them: they land in order). LandResolvesLocked with the display device's
+// lock held.
+bool ResolvePending(uint32_t lo, uint32_t hi);
+void LandResolves(uint32_t lo, uint32_t hi);
+void LandResolvesLocked(uint32_t lo, uint32_t hi);
+// How many times resolves were landed (all, and by LandResolves(lo, hi)),
+// for the test harness.
+uint64_t ResolveLandings();
+uint64_t ResolveOverlapLandings();
 
 // The EDRAM's buffer on the display's device (its lock held), and the
 // GLSL for its layout and formats: EdramWord, a sample's word; Unpack and
 // PackTarget, a colour target's words; the depth formats' conversions.
 gfx::BufferId EdramBuffer();
 extern const char kEdramGlsl[];
+// A vertex stage drawing one triangle over the whole target.
+extern const char kFullTargetVertex[];
+
+// The EDRAM's float and depth formats' values, as kEdramGlsl's
+// unpackHalf2x16, F7e3, Unorm24 and F20e4 give them: a half, 7e3 (bits
+// 0-9), 24-bit unorm and 20e4 (bits 0-23).
+float Half(uint16_t h);
+float F7e3(uint32_t f);
+float Unorm24(uint32_t d);
+float F20e4(uint32_t f);
 
 // Byte offset of block (x, y) in a 2D tiled surface `pitch` blocks wide
 // (a multiple of 32), blocks of 1 << bpb_log2 bytes; negative coordinates

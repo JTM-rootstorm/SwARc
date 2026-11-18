@@ -24,7 +24,12 @@ console can settle.
   have the side effects Xenia gives them: SCRATCH_REG0-7 are written back
   to SCRATCH_ADDR + 4n when SCRATCH_UMSK enables them; a write to
   COHER_STATUS_HOST sets its bit 31, and a WAIT_REG_MEM on it clears the
-  register (caches here are always coherent).
+  register (caches here are always coherent). The request lands no
+  resolve ("EDRAM and resolves"; a choice: it is for the GPU's own later
+  reads of the memory a resolve wrote, which here take the resolve's
+  results from the device or land it first; a title that polled the
+  register from the CPU and then read the texels without a fence would
+  see them late; console check).
 
 ## The ring buffer
 - VdInitializeRingBuffer(physical address, log2): 2^(log2 + 3) bytes,
@@ -141,15 +146,30 @@ none of it has been checked on a console yet.
   first texel's 32x32 block to the end of the last's) and writes all of
   it back, the bytes outside the rectangle as they were. Its texels
   reach memory later, before anything the guest sees of the GPU's
-  progress that comes after it: a packet that writes or reads memory, an
-  interrupt, a coherency request that WAIT_REG_MEM looks at, a swap, the
-  read pointer. A resolve whose range overlaps one still on the device
-  waits for that one's texels first. On the console the texels are
-  written as the copy runs; a title that reads them without a fence or
-  writes into the range while the resolve runs would see the difference
-  (a choice, so that the command processor does not wait for the host
-  GPU after each resolve). Textures in the range decode again before
-  they are next sampled ("Textures").
+  progress that comes after it: a packet that writes or reads memory
+  for the guest (a fence, MEM_WRITE, REG_TO_MEM, WAIT_REG_MEM on memory,
+  scratch register write-back, occlusion query counts, the extents of
+  EVENT_WRITE_EXT), an interrupt,
+  a swap, the read pointer; and before the GPU's own reads of memory a
+  resolve still on the device wrote: an indirect buffer's packets,
+  IM_LOAD's microcode, LOAD_ALU_CONSTANT's constants, a draw's indices
+  and vertices, a texture decoded or hashed on the CPU (then all of
+  them land, in order). A resolve whose range overlaps one still on the
+  device waits for that one's texels first. On the console the texels
+  are written as the copy runs; a title that reads them without a fence
+  or writes into the range while the resolve runs would see the
+  difference (a choice, so that the command processor does not wait for
+  the host GPU after each resolve).
+- Textures the cache holds in the range take the copy's texels on the
+  device where they can, decoded as their format decodes the copy's
+  words; the others decode again before they are next sampled
+  ("Textures").
+- A clear that covers all the rows a host target uses, and the
+  surface's width, of the target of the surface it clears (base, pitch,
+  MSAA, format) clears that host target to what a load of the cleared
+  words gives, and leaves it valid; other targets whose tiles the
+  cleared rows touch load again; the others are not touched
+  ("Render targets").
 
 ## Shaders
 The microcode's encoding and its instructions' meaning are Xenia's (its
@@ -387,12 +407,14 @@ been checked on a console yet.
   and their _AS_16_16_16_16 forms, 16, 16_16, 16_16_16_16), 16-bit
   snorm (an integer format with a signed component), half floats
   (16_EXPAND and _FLOAT formats) and floats (24_8 as 24-bit unorm,
-  24_8_FLOAT as 20e4, the 32-bit float formats). Missing components
-  repeat the last (RRRR, RGGG, RGBB), as Xenia's host swizzles do;
-  8_8_8_8_A is taken as 8_8_8_8 (a choice). The other formats (1-bit,
-  8_B, the EDRAM, 32-bit integer, AS_8, MPEG and interlaced ones), tiled
-  formats of 3-word blocks, signed compressed and YUV textures and tiled
-  or packed 1D textures are fatal, not implemented yet.
+  24_8_FLOAT as 20e4, the 32-bit float formats); 10- and 2-bit
+  components go to 16-bit unorm rounded to nearest in integers. Missing
+  components repeat the last (RRRR, RGGG, RGBB), as Xenia's host
+  swizzles do; 8_8_8_8_A is taken as 8_8_8_8 (a choice). The other
+  formats (1-bit, 8_B, the EDRAM, 32-bit integer, AS_8, MPEG and
+  interlaced ones), tiled formats of 3-word blocks, signed compressed and
+  YUV textures and tiled or packed 1D textures are fatal, not
+  implemented yet.
 - Signs, per data component: 1 signed (v / (2^(n-1) - 1), at least -1;
   the host image then 16-bit snorm), 2 biased (2v - 1) and 3 gamma
   (Xenia's PWLGammaToLinear), both applied after filtering, as Xenia
@@ -417,16 +439,32 @@ been checked on a console yet.
   (the host device has no border colours).
 - Vertex shaders sample textures too, with their own bindings.
 - The cache, by the constant's words (less the fields the sampler and
-  xe_sample take): a texture decodes when first sampled; a resolve that
-  writes its memory marks it to decode again; once a frame (a swap) its
-  memory is hashed and it decodes again when that changed (a choice:
-  no tracking of CPU writes; a CPU write within a frame and undone by
-  its end is missed, and a texture written by the CPU and sampled in the
-  same frame after another sample of it shows the older contents).
-  Textures not sampled for 300 frames are dropped. Decoding and hashing
-  run on the CPU (big levels and ranges on several threads), so a title
-  that samples big resolve destinations every frame pays for their
-  decode every frame.
+  xe_sample take): a texture decodes when first sampled, after the
+  resolves still on the device that wrote its memory land. Decoding and
+  hashing run on the CPU (big levels and ranges on several threads).
+- A resolve into a texture the cache holds updates it on the device,
+  from the EDRAM before the resolve's clears, where its level 0 is the
+  copy's destination: a 2D tiled texture of one level (none packed into
+  a tail), at the copy's base or that of one of its 32x32 blocks with
+  the copy's rectangle within its rows, the copy's pitch and endian
+  swap, unsigned (the float formats ignore signs), in a format whose
+  texels are the copy's words as they are (8_8_8_8 and its _A and
+  _AS_16_16_16_16 forms, 2_10_10_10 and its _AS_16_16_16_16 form,
+  16_16, 16_16_16_16, the half float pairs and quadruples as _FLOAT or
+  _EXPAND, 32_FLOAT, 32_32_FLOAT, 24_8 and 24_8_FLOAT of a depth
+  resolve). Each texel is what decoding the copy's words on the CPU
+  gives. A texture there that does not match decodes again.
+- Its memory is checked against a hash (a choice: no tracking of CPU
+  writes): once a frame (a swap), at its first use, unless a resolve
+  still on the device wrote there, it decodes again when the hash
+  changed; a texture a resolve updated on the device is hashed when the
+  resolve lands. A CPU write within a frame and undone by its end is
+  missed, a texture written by the CPU and sampled in the same frame
+  after another sample of it shows the older contents, and a CPU write
+  to a texture after a resolve updated it on the device and before the
+  resolve lands, outside the bytes the resolve writes back, is missed
+  (inside them, memory itself loses it).
+- Textures not sampled for 300 frames are dropped.
 
 ## Render targets
 - Colour targets 0-3 (RB_COLOR_INFO, RB_COLOR1-3_INFO at 0x2001,
@@ -460,8 +498,13 @@ been checked on a console yet.
   reach: before a draw, other targets drawn into whose tiles overlap a
   bound one's are stored to the EDRAM, and all overlapping ones become
   stale; a stale target (or rows it had not used) loads from the EDRAM.
-  A resolve stores every target drawn into before it reads the EDRAM,
-  and after its clears every target is stale.
+  A resolve stores every target drawn into before it reads the EDRAM.
+  Its clear clears the host target of the surface it clears where it
+  covers all of the target's rows in use and the surface's width (the
+  columns of the target's last tile past the surface's width too,
+  which nothing of the surface uses), to what a load of the cleared
+  words gives; other targets whose tiles the cleared rows touch become
+  stale.
 - Loads and stores convert as resolves read: a colour target's words
   unpacked and packed back (unorm rounded to nearest; 7e3 rounded to
   the nearest even, clamped to [0, 31.875], below 0.25 denormal, as
@@ -473,7 +516,10 @@ been checked on a console yet.
   A depth tile's two 40-sample halves are swapped, as resolves read
   them. The host samples depth but not stencil: stencil is loaded a
   bit at a time (eight passes setting one bit where the EDRAM's is set)
-  and read back the same way into an 8-bit image, by stencil tests.
+  and read back the same way into an 8-bit image, by stencil tests;
+  where a depth target's stencil is known to be one value in all its
+  rows in use (after a clear of it, until a load or a draw whose stencil
+  test can write it), it is stored as that value without the passes.
 
 ## Presentation
 - A swap packet shows its front buffer: the texture fetch constant the
