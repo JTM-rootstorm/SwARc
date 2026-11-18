@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+#include "runtime/gfx/device.h"
+
 namespace recomp::xbox360 {
 
 // 2048 tiles of 80x16 32-bit samples.
@@ -26,6 +28,12 @@ void Resolve();
 // GPU's progress (memory it writes or reads, interrupts, the read
 // pointer, a swap): the results of the resolves before it, in memory.
 void LandResolves();
+
+// The EDRAM's buffer on the display's device (its lock held), and the
+// GLSL for its layout and formats: EdramWord, a sample's word; Unpack and
+// PackTarget, a colour target's words; the depth formats' conversions.
+gfx::BufferId EdramBuffer();
+extern const char kEdramGlsl[];
 
 // Byte offset of block (x, y) in a 2D tiled surface `pitch` blocks wide
 // (a multiple of 32), blocks of 1 << bpb_log2 bytes; negative coordinates

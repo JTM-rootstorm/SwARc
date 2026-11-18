@@ -3,7 +3,12 @@ below, under the licences that follow.
 
 tests/ppc/vmx128_test.cpp: test vectors (input and expected
 registers) from Xenia's CPU tests, src/xenia/cpu/testing/pack_test.cc,
-unpack_test.cc and src/xenia/cpu/ppc/testing/instr_*128.s:
+unpack_test.cc and src/xenia/cpu/ppc/testing/instr_*128.s; and
+platforms/xbox360/src/xbox360 (edram.cpp, texture.cpp, render.cpp,
+shader.cpp): functions ported from Xenia's GPU code, src/xenia/gpu
+(texture_address.h's tiled addressing, texture_util.cc's
+GetPackedMipOffset, xenos.h's and the shader translators' 7e3, 20e4,
+24-bit unorm and piecewise-linear gamma conversions):
 
 Copyright (c) 2015, Ben Vanik.
 All rights reserved.

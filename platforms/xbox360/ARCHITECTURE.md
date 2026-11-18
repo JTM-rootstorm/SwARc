@@ -254,15 +254,15 @@ host's.
 
 ### The GPU
 The GPU (`src/xbox360/gpu.{h,cpp}`) is what the kernel's display driver
-and titles see of the Xenos, without drawing yet (docs/xenos.md):
+and titles see of the Xenos, and its draws (docs/xenos.md):
 - Its registers are guest memory at 0x7FC80000, where the console maps
   them, so guest code reads and writes them with plain loads and stores;
   nothing traps an access. The values titles read are set at power-on.
 - The command processor is a kernel thread that polls CP_RB_WPTR and
   executes the ring buffer's PM4 packets up to it: register writes,
   memory writes, waits, fences, indirect buffers, interrupts, the swap
-  packet VdSwap writes. Draws and shader loads are consumed; an opcode it
-  does not know is fatal. It writes the read pointer back as the driver
+  packet VdSwap writes, shader loads and draws. An opcode it does not
+  know is fatal. It writes the read pointer back as the driver
   asked.
 - The vertical blank is another kernel thread, at the video mode's rate.
   Both deliver the graphics interrupt callback as a DPC.
@@ -278,9 +278,25 @@ and titles see of the Xenos, without drawing yet (docs/xenos.md):
   the next swap waits until it has. On SDL's offscreen video driver
   (automated tests) the device has no window and frames reach only the
   dev aids.
-Drawing (milestone 5) adds a renderer behind the same command processor,
-through gfx::Device: shaders translated to GLSL programs, drawing into
-host targets that load from and store to the EDRAM buffer.
+- The renderer (`render.{h,cpp}`) draws through gfx::Device: the
+  shaders' microcode translated to GLSL (`shader.{h,cpp}`) as one
+  program per vertex shader, pixel shader and kind of host draw (lists
+  of guest indices made on the CPU from strips, fans, loops and quads;
+  rectangles and point sprites expanded in the vertex stage), with the
+  render state (blending, depth and stencil, culling, the alpha test)
+  mapped to the host's, drawing into a host image per EDRAM colour or
+  depth target, MSAA supersampled. A target loads its rows from the
+  EDRAM buffer before the draws into it that need them (a draw that
+  writes the depth, stencil a bit at a time), and stores into it before
+  a resolve or before an overlapping target is drawn into (compute,
+  stencil read back through stencil tests); a resolve's clears make
+  every target load again. Draws outside what is implemented
+  (docs/xenos.md, "Drawing") are fatal.
+- Textures (`texture.{h,cpp}`) are decoded on the CPU from guest memory
+  into host images, kept by fetch constant; a resolve into one, or a
+  change of its memory seen by a hash once a frame, decodes it again,
+  and those not sampled for a while are dropped (docs/xenos.md,
+  "Textures").
 
 ### Audio
 The audio render driver (`src/xbox360/audio.{h,cpp}`, docs/xboxkrnl.md
@@ -386,15 +402,16 @@ builds and runs them too.
    and xam HLE, written against the system's own behaviour. In progress:
    the libraries and their layout, memory, threads, synchronisation,
    files, the title's module, the settings, the display driver with a
-   command processor that executes the ring buffer without drawing, and
-   the audio render driver, timers, the kernel exports and xam's startup
+   command processor that executes the ring buffer, and the audio
+   render driver, timers, the kernel exports and xam's startup
    ones (the loader, networking, memory, messages, the music player's,
    users, profile settings, notifications, content), APCs, the XGI and
    XLiveBase messages titles send, XMA decoding, the kernel's edge cases,
    controllers, and the imports no title had called yet (xam's network
    stack, structured exceptions, bug checks) are done.
 5. Xenos: drawing, shaders and presentation through gfx::Device, behind
-   the command processor (which runs the ring buffer already). In
-   progress: the EDRAM and resolves (copies, conversions, sample
-   averages, clears) and the front buffer's presentation (k_8_8_8_8) are
-   done; shader translation and draws are next.
+   the command processor. In progress: the EDRAM and resolves (copies,
+   conversions, sample averages, clears), the front buffer's
+   presentation (k_8_8_8_8), shader translation, draws (primitive types,
+   render state, MSAA, the colour and depth formats) and textures are
+   done; what docs/xenos.md lists as fatal is not.

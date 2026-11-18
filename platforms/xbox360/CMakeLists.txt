@@ -37,6 +37,9 @@ add_library(recomp_xbox360 SHARED
   src/xbox360/module.cpp
   src/xbox360/objects.cpp
   src/xbox360/process.cpp
+  src/xbox360/render.cpp
+  src/xbox360/shader.cpp
+  src/xbox360/texture.cpp
   src/xbox360/thread.cpp
   src/xbox360/xma.cpp)
 target_link_libraries(recomp_xbox360 PUBLIC recomp_ppc recomp_xbox360_image Threads::Threads

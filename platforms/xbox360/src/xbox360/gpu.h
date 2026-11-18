@@ -3,8 +3,8 @@
 // see it (ARCHITECTURE.md, "Runtime: the GPU"): its registers, which guest
 // code reads and writes in guest memory where the console maps them; the
 // command processor, which executes the PM4 packets of the ring buffer the
-// driver sets up (registers, memory writes, waits, fences, interrupts),
-// without drawing yet; and the display's vertical blank. GPU addresses
+// driver sets up (registers, memory writes, waits, fences, interrupts,
+// shader loads and draws: render.h); and the display's vertical blank. GPU addresses
 // are physical (the low 29 bits); the GPU reads and writes memory
 // little-endian, with the endian swap a packet's address asks for.
 
@@ -22,7 +22,7 @@ constexpr uint32_t kRegCpRbRptr = 0x01C4, kRegCpRbWptr = 0x01C5, kRegScratchUmsk
                    kRegRbHsioAligner = 0x0F2D, kRegD1ModeVCounter = 0x194C,
                    kRegInterruptStatus = 0x1951, kRegD1ModeViewportSize = 0x1961,
                    kRegVgtEventInitiator = 0x21F9, kRegRbModeControl = 0x2208,
-                   kRegRbSampleCountAddr = 0x2325,
+                   kRegRbSampleCountAddr = 0x2325, kRegVgtMaxVtxIndx = 0x2100,
                    kRegShaderConstantFetch = 0x4800;
 
 uint32_t GpuRegister(uint32_t r);

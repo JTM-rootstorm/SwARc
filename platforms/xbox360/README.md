@@ -7,8 +7,8 @@ and linked against a runtime that reimplements the console's kernel,
 system library and GPU. Built only with
 `RECOMP_PLATFORM_XBOX360`; the x86 core (`RECOMP_X86`) can be off.
 
-Status: milestones 1-3 of [ARCHITECTURE.md](ARCHITECTURE.md), and the
-runtime (milestone 4) begun. The XEX2 reader (with its own LZX decoder)
+Status: milestones 1-3 of [ARCHITECTURE.md](ARCHITECTURE.md) done, the
+runtime (milestone 4) and the GPU (milestone 5) in progress. The XEX2 reader (with its own LZX decoder)
 and the integer, floating-point, VMX and VMX128 core lift system modules
 and titles with every instruction decoded, and a fixture runs lifted with
 the same output as on a PowerPC 970 in 32-bit mode, every instruction
@@ -23,9 +23,9 @@ profile settings, notifications, content packages as host directories,
 the XGI and Live apps' messages offline, its network stack with no
 cable) and its message dispatch, timers, controllers through SDL3's
 gamepads, with a GPU command processor that executes a title's ring
-buffer and its resolves (the EDRAM on the host GPU), without drawing
-yet, audio output through SDL3 and XMA decoding, which a test title
-checks.
+buffer, its draws (shaders translated to GLSL, render state, textures
+decoded from guest memory) and resolves (the EDRAM on the host GPU),
+audio output through SDL3 and XMA decoding, which a test title checks.
 
 ## Using it
 

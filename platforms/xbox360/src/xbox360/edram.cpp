@@ -1,6 +1,12 @@
 // The EDRAM and resolves (edram.h). The layout, the resolve's rectangle,
 // sample and format rules are Xenia's render target cache and resolve
 // shaders' (BSD-3; docs/xenos.md, where the console checks are listed).
+//
+// Tiled2D and the 7e3, 20e4 and 24-bit unorm conversions are ported from
+// Xenia's (texture_address.h; xenos.h and the SPIR-V translator's
+// Float32To7e3, Float20e4To32, Float32To20e4, UNorm24To32):
+// Copyright (c) 2015, Ben Vanik. All rights reserved. BSD 3-Clause; the
+// licence is in NOTICE.
 
 #include "xbox360/edram.h"
 
@@ -18,6 +24,8 @@
 #include "xbox360/gpu.h"
 #include "xbox360/hle.h"
 #include "xbox360/memory.h"
+#include "xbox360/render.h"
+#include "xbox360/texture.h"
 
 namespace recomp::xbox360 {
 namespace {
@@ -52,20 +60,6 @@ enum : uint32_t {
 // The swaps of red and blue a resolve's copy_dest_swap makes, by layout.
 enum : uint32_t { kSwapNone = 0, kSwap8888 = 1, kSwap2101010 = 2, kSwap16x4 = 3 };
 
-const char kCommon[] = R"(
-layout(local_size_x = 8, local_size_y = 8) in;
-// The EDRAM word of sample s of pixel p of a target: base tile, pitch in
-// 32bpp tiles, sample shifts (x, y), 64bpp, depth.
-uint EdramWord(ivec2 p, uint s, uint base, uint pitch, uvec2 shift, bool wide, bool depth) {
-  uint sx = (uint(p.x) << shift.x) + ((s >> 1u) & shift.x);
-  uint sy = (uint(p.y) << shift.y) + (s & shift.y);
-  uint tile_w = wide ? 40u : 80u;
-  uint tile = (base + (sy / 16u) * (wide ? pitch * 2u : pitch) + sx / tile_w) & 2047u;
-  uint ix = sx % tile_w;
-  if (depth) ix = ix < 40u ? ix + 40u : ix - 40u;
-  return tile * 1280u + ((sy % 16u) * tile_w + ix) * (wide ? 2u : 1u);
-}
-)";
 
 // Clear: every sample of the rectangle's pixels.
 const char kClear[] = R"(
@@ -112,41 +106,6 @@ int Tiled2D(int x, int y, int pitch, int bpb) {
   int bank = (y >> 4) & 1, pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
   return (oi & 15) | ((y & 1) << 4) | (((oi >> 4) & 1) << 5) | (pipe << 6) |
          (((oi >> 5) & 7) << 8) | (bank << 11) | ((oi >> 8) << 12);
-}
-// The Xenos's 7e3 float (bits 0-9): 3 exponent bits biased by 3, no
-// infinity or NaN, [0, 32).
-float F7e3(uint f) {
-  f &= 0x3FFu;
-  if (f == 0u) return 0.0;
-  uint m = f & 0x7Fu;
-  int e = int(f >> 7);
-  if (e == 0) {
-    int lz = 7 - findMSB(m);
-    e = 1 - lz;
-    m = (m << uint(lz)) & 0x7Fu;
-  }
-  // The 7 mantissa bits are the float's top ones (as Xenia's SPIR-V
-  // translator places them; its C++ Float7e3To32 shifts them by 3).
-  return uintBitsToFloat(uint(e + 124) << 23 | (m << 16));
-}
-float Un(uint v, uint shift, uint bits) {
-  return float((v >> shift) & ((1u << bits) - 1u)) / float((1u << bits) - 1u);
-}
-// 16_16(_16_16) targets: signed 16-bit fixed point over [-32, 32].
-vec2 Fixed16(uint v) { return max(vec2(-32.0), vec2(ivec2(int(v << 16), int(v)) >> 16) * (32.0 / 32767.0)); }
-uint Pk(float f, uint bits) { return uint(clamp(f, 0.0, 1.0) * float((1u << bits) - 1u) + 0.5); }
-vec4 Unpack(uint fmt, uint v0, uint v1) {
-  switch (fmt) {
-    case 0u: return vec4(Un(v0, 0u, 8u), Un(v0, 8u, 8u), Un(v0, 16u, 8u), Un(v0, 24u, 8u));
-    case 2u: case 10u: return vec4(Un(v0, 0u, 10u), Un(v0, 10u, 10u), Un(v0, 20u, 10u), Un(v0, 30u, 2u));
-    case 3u: case 12u: return vec4(F7e3(v0), F7e3(v0 >> 10), F7e3(v0 >> 20), Un(v0, 30u, 2u));
-    case 4u: return vec4(Fixed16(v0), 0.0, 0.0);
-    case 5u: return vec4(Fixed16(v0), Fixed16(v1));
-    case 6u: return vec4(unpackHalf2x16(v0), 0.0, 0.0);
-    case 7u: return vec4(unpackHalf2x16(v0), unpackHalf2x16(v1));
-    case 14u: return vec4(uintBitsToFloat(v0), 0.0, 0.0, 0.0);
-    default: return vec4(uintBitsToFloat(v0), uintBitsToFloat(v1), 0.0, 0.0);  // 15
-  }
 }
 uvec2 Pack(uint fmt, vec4 c) {
   switch (fmt) {
@@ -228,12 +187,12 @@ State& Device() {
   std::vector<uint8_t> zero(kEdramBytes);
   dev.UpdateBuffer(s->edram, 0, zero.data(), kEdramBytes);
   gfx::ProgramDesc d;
-  d.cs.glsl = std::string(kCommon) + kClear;
+  d.cs.glsl = std::string(kEdramGlsl) + kClear;
   d.cs.rw_buffers = 1;
   d.cs.uniform_bytes = 64;
   d.local_size[0] = d.local_size[1] = 8;
   s->clear = dev.CreateProgram(d);
-  d.cs.glsl = std::string(kCommon) + kCopy;
+  d.cs.glsl = std::string(kEdramGlsl) + kCopy;
   d.cs.buffers = 1;
   d.cs.uniform_bytes = 80;
   s->copy = dev.CreateProgram(d);
@@ -355,6 +314,106 @@ void Dispatch(State& s, gfx::ProgramId prog, const Rect& r, const void* uniforms
 
 }  // namespace
 
+const char kEdramGlsl[] = R"(
+// The EDRAM word of sample s of pixel p of a target: base tile, pitch in
+// 32bpp tiles, sample shifts (x, y), 64bpp, depth.
+uint EdramWord(ivec2 p, uint s, uint base, uint pitch, uvec2 shift, bool wide, bool depth) {
+  uint sx = (uint(p.x) << shift.x) + ((s >> 1u) & shift.x);
+  uint sy = (uint(p.y) << shift.y) + (s & shift.y);
+  uint tile_w = wide ? 40u : 80u;
+  uint tile = (base + (sy / 16u) * (wide ? pitch * 2u : pitch) + sx / tile_w) & 2047u;
+  uint ix = sx % tile_w;
+  if (depth) ix = ix < 40u ? ix + 40u : ix - 40u;
+  return tile * 1280u + ((sy % 16u) * tile_w + ix) * (wide ? 2u : 1u);
+}
+// The Xenos's 7e3 float (bits 0-9): 3 exponent bits biased by 3, no
+// infinity or NaN, [0, 32).
+float F7e3(uint f) {
+  f &= 0x3FFu;
+  if (f == 0u) return 0.0;
+  uint m = f & 0x7Fu;
+  int e = int(f >> 7);
+  if (e == 0) {
+    int lz = 7 - findMSB(m);
+    e = 1 - lz;
+    m = (m << uint(lz)) & 0x7Fu;
+  }
+  // The 7 mantissa bits are the float's top ones (as Xenia's SPIR-V
+  // translator places them; its C++ Float7e3To32 shifts them by 3).
+  return uintBitsToFloat(uint(e + 124) << 23 | (m << 16));
+}
+float Un(uint v, uint shift, uint bits) {
+  return float((v >> shift) & ((1u << bits) - 1u)) / float((1u << bits) - 1u);
+}
+// 16_16(_16_16) targets: signed 16-bit fixed point over [-32, 32].
+vec2 Fixed16(uint v) { return max(vec2(-32.0), vec2(ivec2(int(v << 16), int(v)) >> 16) * (32.0 / 32767.0)); }
+uint Pk(float f, uint bits) { return uint(clamp(f, 0.0, 1.0) * float((1u << bits) - 1u) + 0.5); }
+vec4 Unpack(uint fmt, uint v0, uint v1) {
+  switch (fmt) {
+    case 0u: case 1u: return vec4(Un(v0, 0u, 8u), Un(v0, 8u, 8u), Un(v0, 16u, 8u), Un(v0, 24u, 8u));
+    case 2u: case 10u: return vec4(Un(v0, 0u, 10u), Un(v0, 10u, 10u), Un(v0, 20u, 10u), Un(v0, 30u, 2u));
+    case 3u: case 12u: return vec4(F7e3(v0), F7e3(v0 >> 10), F7e3(v0 >> 20), Un(v0, 30u, 2u));
+    case 4u: return vec4(Fixed16(v0), 0.0, 0.0);
+    case 5u: return vec4(Fixed16(v0), Fixed16(v1));
+    case 6u: return vec4(unpackHalf2x16(v0), 0.0, 0.0);
+    case 7u: return vec4(unpackHalf2x16(v0), unpackHalf2x16(v1));
+    case 14u: return vec4(uintBitsToFloat(v0), 0.0, 0.0, 0.0);
+    default: return vec4(uintBitsToFloat(v0), uintBitsToFloat(v1), 0.0, 0.0);  // 15
+  }
+}
+// A float as 7e3, clamped to [0, 31.875] (NaN to 0) and rounded to the
+// nearest even (Xenia's Float32To7e3 of its SPIR-V translator).
+uint F32To7e3(float f) {
+  uint u = floatBitsToUint(isnan(f) ? 0.0 : clamp(f, 0.0, 31.875));
+  uint b = u < 0x3E800000u ? ((u & 0x7FFFFFu) | 0x800000u) >> min(125u - (u >> 23), 24u) : u - (124u << 23);
+  return ((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16) & 0x3FFu;
+}
+int Fx16(float f) { return int(roundEven(clamp(f, -32.0, 32.0) * (32767.0 / 32.0))) & 0xFFFF; }
+// What Unpack unpacks, packed: a colour target's word(s).
+uvec2 PackTarget(uint fmt, vec4 c) {
+  switch (fmt) {
+    case 0u: case 1u: return uvec2(Pk(c.r, 8u) | Pk(c.g, 8u) << 8 | Pk(c.b, 8u) << 16 | Pk(c.a, 8u) << 24, 0u);
+    case 2u: case 10u: return uvec2(Pk(c.r, 10u) | Pk(c.g, 10u) << 10 | Pk(c.b, 10u) << 20 | Pk(c.a, 2u) << 30, 0u);
+    case 3u: case 12u:
+      return uvec2(F32To7e3(c.r) | F32To7e3(c.g) << 10 | F32To7e3(c.b) << 20 | Pk(c.a, 2u) << 30, 0u);
+    case 4u: return uvec2(uint(Fx16(c.r) | Fx16(c.g) << 16), 0u);
+    case 5u: return uvec2(uint(Fx16(c.r) | Fx16(c.g) << 16), uint(Fx16(c.b) | Fx16(c.a) << 16));
+    case 6u: return uvec2(packHalf2x16(c.rg), 0u);
+    case 7u: return uvec2(packHalf2x16(c.rg), packHalf2x16(c.ba));
+    case 14u: return uvec2(floatBitsToUint(c.r), 0u);
+    default: return uvec2(floatBitsToUint(c.r), floatBitsToUint(c.g));  // 15
+  }
+}
+// Depth's 24 bits: unorm (D24S8) or the 20e4 float of D24FS8 ([0, 2), 4
+// exponent bits biased by 15), as Xenia converts them (UNorm24To32,
+// Float20e4To32, Float32To20e4 rounding to the nearest even).
+float Unorm24(uint d) { return float(d + (d >> 23)) * (1.0 / 16777216.0); }
+uint F32ToUnorm24(float f) { return uint(roundEven(clamp(f, 0.0, 1.0) * 16777215.0)); }
+float F20e4(uint f) {
+  f &= 0xFFFFFFu;
+  if (f == 0u) return 0.0;
+  uint m = f & 0xFFFFFu;
+  int e = int(f >> 20);
+  if (e == 0) {
+    int lz = 20 - findMSB(m);
+    e = 1 - lz;
+    m = (m << uint(lz)) & 0xFFFFFu;
+  }
+  return uintBitsToFloat(uint(e + 112) << 23 | m << 3);
+}
+uint F32To20e4(float f) {
+  if (!(f > 0.0)) return 0u;
+  uint u = floatBitsToUint(f);
+  if (u >= 0x3FFFFFF8u) return 0xFFFFFFu;
+  if (u < 0x38800000u) u = (0x800000u | (u & 0x7FFFFFu)) >> min(113u - (u >> 23), 24u);
+  else u += 0xC8000000u;
+  u += 3u + ((u >> 3) & 1u);
+  return (u >> 3) & 0xFFFFFFu;
+}
+)";
+
+gfx::BufferId EdramBuffer() { return Device().edram; }
+
 void LandResolves() {
   if (g_pending.empty()) return;
   std::lock_guard<std::mutex> l(HostDeviceLock());
@@ -431,10 +490,14 @@ void Resolve() {
   // The copy reads the whole range and writes all of it back, the bytes
   // outside the rectangle as they were: one that overlaps an earlier
   // resolve's waits for its results.
+  // What draws left in the host targets, into the EDRAM first.
+  StoreTargets();
   bool overlaps = g_pending.size() >= kMaxPending;
   for (const Range& p : g_pending) overlaps |= p.lo < hi && lo < p.hi;
   if (overlaps) LandResolves();
   g_pending.push_back({lo, hi});
+  // Textures there decode again before they are next sampled.
+  InvalidateTextures(lo, hi);
   std::lock_guard<std::mutex> l(HostDeviceLock());
   State& s = Device();
   gfx::BufferData edram_in{nullptr, kEdramBytes, s.edram, 0};
@@ -481,6 +544,7 @@ void Resolve() {
     clear.value[1] = GpuRegister(kRegRbColorClearLo);
     Dispatch(s, s.clear, r, &clear, nullptr, &edram_out);
   }
+  if (clear_color || clear_depth) InvalidateTargets();
 }
 
 }  // namespace recomp::xbox360
